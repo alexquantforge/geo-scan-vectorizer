@@ -21,6 +21,9 @@ ALIGNED_DOT_MIN_SPACING = 40.0
 DOT_CANDIDATE_MERGE_DISTANCE = 9.0
 ALIGNED_DOT_MIN_LINE_CLEARANCE = 20.0
 DOT_LINE_FILTER_MIN_SEGMENT_LENGTH = 20.0
+DOT_CANDIDATE_INTENSITY_THRESHOLD = 100
+DOT_LINE_CONTINUITY_SUPPORT_THRESHOLD = 0.65
+DOT_LINE_INK_THRESHOLD = 110
 
 
 def split_into_tiles(img, cols, rows, overlap):
@@ -525,16 +528,22 @@ def detect_small_circles(gray, binary):
     return circles
 
 
-def detect_dot_candidates(tile, gray):
-    """Extract compact dark components before checking whether they form a row."""
+def dot_candidate_grayscale(tile, gray):
+    """Whiten saturated overlays while preserving the source's dark ink."""
     hsv = cv2.cvtColor(tile, cv2.COLOR_BGR2HSV)
     colored_overlay = (hsv[:, :, 1] > 90) & (hsv[:, :, 2] > 60)
     colored_overlay = cv2.dilate(
         colored_overlay.astype(np.uint8), np.ones((3, 3), np.uint8), iterations=1
     )
-
     dot_gray = gray.copy()
     dot_gray[colored_overlay > 0] = 255
+    return dot_gray
+
+
+def detect_dot_candidates(tile, gray, dot_gray=None):
+    """Extract compact dark components before checking whether they form a row."""
+    if dot_gray is None:
+        dot_gray = dot_candidate_grayscale(tile, gray)
     dot_gray = cv2.GaussianBlur(dot_gray, (3, 3), 0)
     padding = 20
     dot_gray = cv2.copyMakeBorder(
@@ -545,7 +554,9 @@ def detect_dot_candidates(tile, gray):
         padding,
         cv2.BORDER_REFLECT_101,
     )
-    binary = np.where(dot_gray <= 80, 255, 0).astype(np.uint8)
+    binary = np.where(
+        dot_gray <= DOT_CANDIDATE_INTENSITY_THRESHOLD, 255, 0
+    ).astype(np.uint8)
     binary = cv2.morphologyEx(
         binary,
         cv2.MORPH_OPEN,
@@ -595,11 +606,62 @@ def detect_dot_candidates(tile, gray):
     return candidates
 
 
+def _line_has_continuous_support_near_candidate(
+    gray_image, candidate, nearest_x, nearest_y, delta_x, delta_y
+):
+    """Check whether the nearby line continues beyond the compact mark."""
+    if gray_image is None:
+        return True
+
+    segment_length = float(np.hypot(delta_x, delta_y))
+    if segment_length <= 0.0:
+        return True
+
+    tangent = np.array([delta_x, delta_y], dtype=np.float64) / segment_length
+    normal = np.array([-tangent[1], tangent[0]])
+    start_distance = max(5.0, float(candidate["radius"]) + 2.0)
+    end_distance = max(
+        ALIGNED_DOT_MIN_LINE_CLEARANCE,
+        float(candidate["radius"]) * 1.5,
+    )
+    distances = np.arange(start_distance, end_distance + 0.1, 2.0)
+    if len(distances) < 3:
+        return True
+
+    height, width = gray_image.shape[:2]
+    support_by_side = []
+    for side in (-1.0, 1.0):
+        supported_samples = 0
+        valid_samples = 0
+        for distance in distances:
+            point = np.array([nearest_x, nearest_y]) + side * tangent * distance
+            has_dark_ink = False
+            has_valid_pixel = False
+            for normal_offset in (-2, -1, 0, 1, 2):
+                sample = point + normal * normal_offset
+                x = int(round(float(sample[0])))
+                y = int(round(float(sample[1])))
+                if 0 <= x < width and 0 <= y < height:
+                    has_valid_pixel = True
+                    if gray_image[y, x] <= DOT_LINE_INK_THRESHOLD:
+                        has_dark_ink = True
+                        break
+            if has_valid_pixel:
+                valid_samples += 1
+                supported_samples += int(has_dark_ink)
+        if valid_samples < 3:
+            return True
+        support_by_side.append(supported_samples / valid_samples)
+
+    return min(support_by_side) >= DOT_LINE_CONTINUITY_SUPPORT_THRESHOLD
+
+
 def filter_dot_candidates_near_lines(
     candidates,
     line_segments,
     progress_callback=None,
     index_progress_callback=None,
+    gray_image=None,
 ):
     """Discard point centers too close to detected segments via spatial indexing."""
     if not candidates or not line_segments:
@@ -650,6 +712,7 @@ def filter_dot_candidates_near_lines(
                 segment_index
             ]
             if length_squared == 0:
+                nearest_x, nearest_y = x1, y1
                 distance = float(
                     np.hypot(candidate["x"] - x1, candidate["y"] - y1)
                 )
@@ -664,7 +727,14 @@ def filter_dot_candidates_near_lines(
                 distance = float(
                     np.hypot(candidate["x"] - nearest_x, candidate["y"] - nearest_y)
                 )
-            if distance <= threshold:
+            if distance <= threshold and _line_has_continuous_support_near_candidate(
+                gray_image,
+                candidate,
+                nearest_x,
+                nearest_y,
+                delta_x,
+                delta_y,
+            ):
                 on_line = True
                 break
         if not on_line:
@@ -1143,7 +1213,7 @@ def detect_aligned_dots(tile, gray):
     ]
 
 
-def detect_all(tile, x0,y0, dot_candidates_out=None):
+def detect_all(tile, x0, y0, dot_candidates_out=None):
     # Ignore colored blue/cyan marks, but retain dark neutral ink on cyan paper.
     blue_mask = blue_cyan_mask(tile)
     tile_for_detection = tile.copy()
@@ -1205,8 +1275,11 @@ def detect_all(tile, x0,y0, dot_candidates_out=None):
         if candidate[6] in {"straight", "curved", "dashed_curve"}
         and candidate[4] >= DOT_LINE_FILTER_MIN_SEGMENT_LENGTH
     ]
+    dot_gray = dot_candidate_grayscale(tile, gray)
     dot_candidates = filter_dot_candidates_near_lines(
-        detect_dot_candidates(tile, gray), line_segments
+        detect_dot_candidates(tile, gray, dot_gray),
+        line_segments,
+        gray_image=dot_gray,
     )
     # Reflection padding can invent centers just beyond the scan's top/left edge.
     if x0 == 0:

@@ -8,7 +8,8 @@ import csv
 import json
 import math
 import re
-from collections import Counter
+from bisect import bisect_right
+from collections import Counter, OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -27,7 +28,9 @@ try:
         ALIGNED_DOT_MAX_GAP,
         ALIGNED_DOT_MIN_LINE_CLEARANCE,
         DOT_LINE_FILTER_MIN_SEGMENT_LENGTH,
+        blue_cyan_mask,
         detect_all,
+        dot_candidate_grayscale,
         filter_dot_candidates_near_lines,
         group_aligned_dot_candidates,
     )
@@ -40,7 +43,9 @@ except ModuleNotFoundError as exc:  # pragma: no cover - script vs package impor
             ALIGNED_DOT_MAX_GAP,
             ALIGNED_DOT_MIN_LINE_CLEARANCE,
             DOT_LINE_FILTER_MIN_SEGMENT_LENGTH,
+            blue_cyan_mask,
             detect_all,
+            dot_candidate_grayscale,
             filter_dot_candidates_near_lines,
             group_aligned_dot_candidates,
         )
@@ -78,6 +83,47 @@ class Tile:
     y0: int
     x1: int
     y1: int
+
+
+class _TiledDotCandidateGray:
+    """Lazily read grayscale pixels without a scan-sized extra image buffer."""
+
+    def __init__(self, tiles: list[Tile], width: int, height: int, cache_size: int = 4):
+        self.shape = (height, width)
+        self._tiles = {(tile.x0, tile.y0): tile for tile in tiles}
+        self._x_origins = sorted({tile.x0 for tile in tiles})
+        self._y_origins = sorted({tile.y0 for tile in tiles})
+        self._cache_size = cache_size
+        self._gray_cache: OrderedDict[tuple[int, int], Any] = OrderedDict()
+
+    def __getitem__(self, coordinates: tuple[int, int]) -> int:
+        y, x = coordinates
+        if not (0 <= x < self.shape[1] and 0 <= y < self.shape[0]):
+            return 255
+
+        x_index = bisect_right(self._x_origins, x) - 1
+        y_index = bisect_right(self._y_origins, y) - 1
+        if x_index < 0 or y_index < 0:
+            return 255
+        origin = (self._x_origins[x_index], self._y_origins[y_index])
+        tile = self._tiles.get(origin)
+        if tile is None or not (tile.x0 <= x <= tile.x1 and tile.y0 <= y <= tile.y1):
+            return 255
+
+        gray_tile = self._gray_cache.pop(origin, None)
+        if gray_tile is None:
+            image = cv2.imread(str(tile.path), cv2.IMREAD_COLOR)
+            if image is None:
+                raise ValueError(f"OpenCV не смог повторно прочитать тайл: {tile.path}")
+            blue_mask = blue_cyan_mask(image)
+            tile_for_detection = image.copy()
+            tile_for_detection[blue_mask > 0] = (255, 255, 255)
+            gray = cv2.cvtColor(tile_for_detection, cv2.COLOR_BGR2GRAY)
+            gray_tile = dot_candidate_grayscale(image, gray)
+        self._gray_cache[origin] = gray_tile
+        while len(self._gray_cache) > self._cache_size:
+            self._gray_cache.popitem(last=False)
+        return int(gray_tile[y - tile.y0, x - tile.x0])
 
 
 def positive_int(value: str) -> int:
@@ -360,6 +406,7 @@ def detect_tiles(
         existing_line_segments,
         progress_callback=report_line_filter_progress,
         index_progress_callback=report_line_index_progress,
+        gray_image=_TiledDotCandidateGray(tiles, width, height),
     )
     print(
         f"После исключения точек на линиях осталось: "
