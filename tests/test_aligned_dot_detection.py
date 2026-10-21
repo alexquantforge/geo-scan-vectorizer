@@ -24,8 +24,20 @@ class AlignedDotDetectionTests(unittest.TestCase):
             {"x": float(x), "y": 180.0, "radius": 5.0, "area": 30}
             for x in (30, 70, 130, 180, 250, 300)
         ]
+        widely_spaced_points = [
+            {"x": x, "y": y, "radius": 5.0, "area": 30}
+            for x, y in (
+                (19.5, 0.0),
+                (92.5, 129.0),
+                (167.0, 258.4),
+                (224.1, 363.7),
+                (285.3, 470.0),
+                (362.8, 601.5),
+            )
+        ]
 
         self.assertEqual(len(group_aligned_dot_candidates(regular_points)), 6)
+        self.assertEqual(len(group_aligned_dot_candidates(widely_spaced_points)), 6)
         self.assertEqual(group_aligned_dot_candidates(irregular_points), [])
         self.assertEqual(
             filter_dot_candidates_near_lines(regular_points, [(0, 100, 350, 100)]), []
@@ -110,33 +122,32 @@ class AlignedDotDetectionTests(unittest.TestCase):
             self.assertGreater(int(outline_pixel.min()), 230)
             self.assertTrue(preview_path.is_file())
 
-    def test_row_crossing_tile_boundary_is_grouped_globally(self) -> None:
-        source_image = np.full((500, 1000, 3), 220, dtype=np.uint8)
+    def test_widely_spaced_row_crossing_tile_boundaries_is_grouped_globally(self) -> None:
+        source_image = np.full((750, 1000, 3), 220, dtype=np.uint8)
         global_centers = [
-            (350, 100),
-            (400, 125),
-            (450, 150),
-            (500, 175),
-            (550, 200),
-            (600, 225),
+            (300, 50),
+            (372, 175),
+            (445, 300),
+            (517, 425),
+            (590, 550),
+            (663, 675),
         ]
         for center in global_centers:
             cv2.circle(source_image, center, 6, (10, 10, 10), 2, cv2.LINE_AA)
-        left_image = source_image[:, :500]
-        right_image = source_image[:, 500:]
 
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
-            left_path = root / "00000_00000_00499_00499.png"
-            right_path = root / "00500_00000_00999_00499.png"
-            self.assertTrue(cv2.imwrite(str(left_path), left_image))
-            self.assertTrue(cv2.imwrite(str(right_path), right_image))
-            tiles = [
-                Tile(left_path, x0=0, y0=0, x1=499, y1=499),
-                Tile(right_path, x0=500, y0=0, x1=999, y1=499),
-            ]
+            tiles = []
+            for y0 in (0, 500):
+                for x0 in (0, 500):
+                    x1 = min(x0 + 500, 1000) - 1
+                    y1 = min(y0 + 500, 750) - 1
+                    tile_path = root / f"{x0:05d}_{y0:05d}_{x1:05d}_{y1:05d}.png"
+                    tile_image = source_image[y0 : y1 + 1, x0 : x1 + 1]
+                    self.assertTrue(cv2.imwrite(str(tile_path), tile_image))
+                    tiles.append(Tile(tile_path, x0, y0, x1, y1))
 
-            records = detect_tiles(tiles, width=1000, height=500)
+            records = detect_tiles(tiles, width=1000, height=750)
             aligned_dots = [
                 record for record in records if record["type"] == "aligned_dot"
             ]
