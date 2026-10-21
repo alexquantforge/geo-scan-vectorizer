@@ -251,8 +251,8 @@ def detect_small_circles(gray, binary):
     """Find small, closed ring symbols while rejecting isolated texture specks.
 
     A candidate must have a nearly circular outer contour, a centered circular
-    hole, and dark-pixel support around its annulus. The hole test prevents solid
-    blobs from being mistaken for rings; non-maximum suppression removes nested
+    hole with a light interior, and dark-pixel support around its annulus. The
+    bright-core test rejects filled dots; non-maximum suppression removes nested
     contour duplicates.
     """
     closed = cv2.morphologyEx(
@@ -282,7 +282,7 @@ def detect_small_circles(gray, binary):
         aspect_ratio = max(box_width, box_height) / max(1, min(box_width, box_height))
         (outer_x, outer_y), outer_radius = cv2.minEnclosingCircle(contour)
         if not (
-            7.0 <= outer_radius <= 20.0
+            5.5 <= outer_radius <= 20.0
             and aspect_ratio <= 1.4
             and outer_circularity >= 0.5
         ):
@@ -303,7 +303,7 @@ def detect_small_circles(gray, binary):
                 center_offset = float(np.hypot(inner_x - outer_x, inner_y - outer_y))
                 radius_ratio = inner_radius / max(outer_radius, 1.0)
                 if (
-                    0.25 <= radius_ratio <= 0.75
+                    0.3 <= radius_ratio <= 0.9
                     and center_offset <= 4.0
                     and hole_aspect <= 1.5
                     and hole_circularity >= 0.3
@@ -331,8 +331,25 @@ def detect_small_circles(gray, binary):
         center_x = (outer_x + inner_x) / 2.0
         center_y = (outer_y + inner_y) / 2.0
         radius = (outer_radius + inner_radius) / 2.0 + 1.0
+
+        # Verify that the hole is genuinely light, not just a thresholding gap
+        # inside a dark blob. Sample its central disk, away from the ink edge.
+        core_radius = max(1.0, inner_radius * 0.55)
+        core_x0 = max(0, int(np.floor(inner_x - core_radius)))
+        core_x1 = min(gray.shape[1], int(np.ceil(inner_x + core_radius)) + 1)
+        core_y0 = max(0, int(np.floor(inner_y - core_radius)))
+        core_y1 = min(gray.shape[0], int(np.ceil(inner_y + core_radius)) + 1)
+        core_patch = gray[core_y0:core_y1, core_x0:core_x1]
+        core_y, core_x = np.ogrid[core_y0:core_y1, core_x0:core_x1]
+        core_mask = (core_x - inner_x) ** 2 + (core_y - inner_y) ** 2 <= core_radius ** 2
+        core_pixels = core_patch[core_mask]
+        if core_pixels.size < 3:
+            continue
+        core_brightness = float(np.median(core_pixels))
+
         support_radius = radius - 0.8
         supported_angles = 0
+        dark_ring_pixels = []
         sample_count = 48
         for angle in np.linspace(0, 2 * np.pi, sample_count, endpoint=False):
             sample_x = int(round(center_x + support_radius * np.cos(angle)))
@@ -340,11 +357,17 @@ def detect_small_circles(gray, binary):
             y_start, y_end = max(0, sample_y - 2), min(gray.shape[0], sample_y + 3)
             x_start, x_end = max(0, sample_x - 2), min(gray.shape[1], sample_x + 3)
             patch = gray[y_start:y_end, x_start:x_end]
-            if patch.size and np.any(patch <= 110):
-                supported_angles += 1
+            if patch.size:
+                dark_pixels = patch[patch <= 110]
+                if dark_pixels.size:
+                    supported_angles += 1
+                    dark_ring_pixels.extend(dark_pixels.tolist())
 
         dark_support = supported_angles / sample_count
-        if dark_support < 0.5:
+        if dark_support < 0.5 or not dark_ring_pixels:
+            continue
+        ring_brightness = float(np.median(dark_ring_pixels))
+        if core_brightness < 130 or core_brightness - ring_brightness < 30:
             continue
 
         score = (

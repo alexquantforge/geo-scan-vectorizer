@@ -3,7 +3,7 @@ import unittest
 import cv2
 import numpy as np
 
-from scripts.detect_lines import blue_cyan_mask, detect_all
+from scripts.detect_lines import blue_cyan_mask, detect_all, detect_small_circles
 
 
 class DashedCurveDetectionTests(unittest.TestCase):
@@ -100,8 +100,8 @@ class DashedCurveDetectionTests(unittest.TestCase):
 class SmallCircleDetectionTests(unittest.TestCase):
     def test_finds_closed_ring_symbols_and_rejects_specks(self) -> None:
         image = np.full((500, 500, 3), 220, dtype=np.uint8)
-        expected_centers = [(80, 100), (220, 260), (390, 400)]
-        for center, radius in zip(expected_centers, (8, 7, 9)):
+        expected_centers = [(80, 100), (220, 260), (390, 400), (60, 360)]
+        for center, radius in zip(expected_centers, (8, 7, 9, 4)):
             cv2.circle(image, center, radius, (10, 10, 10), 2, cv2.LINE_AA)
 
         # Grid ink, solid specks, and a ring too small to be a target symbol.
@@ -125,8 +125,23 @@ class SmallCircleDetectionTests(unittest.TestCase):
         for circle in circles:
             self.assertEqual(circle[0], circle[2])
             self.assertEqual(circle[1], circle[3])
-            self.assertGreaterEqual(circle[11], 7)
+            self.assertGreater(circle[11], 4)
             self.assertLessEqual(circle[11], 12)
+
+    def test_rejects_dark_center_even_when_contour_has_a_hole(self) -> None:
+        gray = np.full((80, 80), 220, dtype=np.uint8)
+        binary = np.zeros_like(gray)
+        cv2.circle(binary, (40, 40), 9, 255, 3, cv2.LINE_8)
+        cv2.circle(gray, (40, 40), 9, 10, 3, cv2.LINE_8)
+        cv2.circle(gray, (40, 40), 5, 80, -1, cv2.LINE_8)
+
+        self.assertEqual(detect_small_circles(gray, binary), [])
+
+        # The same annulus is retained when its interior is genuinely light.
+        cv2.circle(gray, (40, 40), 5, 220, -1, cv2.LINE_8)
+        circles = detect_small_circles(gray, binary)
+        self.assertEqual(len(circles), 1)
+        self.assertLess(np.hypot(circles[0][0] - 40, circles[0][1] - 40), 1)
 
 
 if __name__ == "__main__":
