@@ -10,6 +10,7 @@ ALIGNED_DOT_MAX_GAP = 170.0
 ALIGNED_DOT_MAX_GAP_MULTIPLE = 3
 ALIGNED_DOT_PARALLEL_BAND_GAP = 16.0
 ALIGNED_DOT_PARALLEL_ANGLE_TOLERANCE = 10.0
+ALIGNED_DOT_PAIR_HYPOTHESIS_MAX_POINTS = 80
 ALIGNED_DOT_MIN_SPAN = 40.0
 ALIGNED_DOT_SPACING_REL_TOLERANCE = 0.22
 ALIGNED_DOT_SPACING_MAX_CV = 0.15
@@ -592,26 +593,56 @@ def detect_dot_candidates(tile, gray):
     return candidates
 
 
-def filter_dot_candidates_near_lines(candidates, line_segments):
-    """Discard point centers that overlap an existing detected line segment."""
-    if not line_segments:
+def filter_dot_candidates_near_lines(
+    candidates, line_segments, progress_callback=None
+):
+    """Discard point centers that overlap a detected segment using a spatial index."""
+    if not candidates or not line_segments:
         return candidates
 
+    cell_size = 128.0
+    maximum_threshold = max(
+        3.0, max(candidate["radius"] * 0.5 for candidate in candidates)
+    )
+    segment_cells = {}
+    prepared_segments = []
+
+    for segment_index, (x1, y1, x2, y2) in enumerate(line_segments):
+        delta_x = x2 - x1
+        delta_y = y2 - y1
+        length_squared = delta_x * delta_x + delta_y * delta_y
+        prepared_segments.append((x1, y1, delta_x, delta_y, length_squared))
+
+        min_cell_x = int((min(x1, x2) - maximum_threshold) // cell_size)
+        max_cell_x = int((max(x1, x2) + maximum_threshold) // cell_size)
+        min_cell_y = int((min(y1, y2) - maximum_threshold) // cell_size)
+        max_cell_y = int((max(y1, y2) + maximum_threshold) // cell_size)
+        for cell_x in range(min_cell_x, max_cell_x + 1):
+            for cell_y in range(min_cell_y, max_cell_y + 1):
+                segment_cells.setdefault((cell_x, cell_y), []).append(segment_index)
+
     filtered = []
-    for candidate in candidates:
+    report_interval = max(1, len(candidates) // 10)
+    for candidate_index, candidate in enumerate(candidates, start=1):
         threshold = max(3.0, candidate["radius"] * 0.5)
+        cell = (
+            int(candidate["x"] // cell_size),
+            int(candidate["y"] // cell_size),
+        )
         on_line = False
-        for x1, y1, x2, y2 in line_segments:
-            delta_x = x2 - x1
-            delta_y = y2 - y1
-            segment_length_squared = delta_x * delta_x + delta_y * delta_y
-            if segment_length_squared == 0:
-                distance = float(np.hypot(candidate["x"] - x1, candidate["y"] - y1))
+        for segment_index in segment_cells.get(cell, ()):
+            x1, y1, delta_x, delta_y, length_squared = prepared_segments[
+                segment_index
+            ]
+            if length_squared == 0:
+                distance = float(
+                    np.hypot(candidate["x"] - x1, candidate["y"] - y1)
+                )
             else:
                 projection = (
                     (candidate["x"] - x1) * delta_x
                     + (candidate["y"] - y1) * delta_y
-                ) / segment_length_squared
+                ) / length_squared
                 projection = min(1.0, max(0.0, projection))
                 nearest_x = x1 + projection * delta_x
                 nearest_y = y1 + projection * delta_y
@@ -623,6 +654,12 @@ def filter_dot_candidates_near_lines(candidates, line_segments):
                 break
         if not on_line:
             filtered.append(candidate)
+
+        if progress_callback is not None and (
+            candidate_index % report_interval == 0
+            or candidate_index == len(candidates)
+        ):
+            progress_callback(candidate_index, len(candidates))
     return filtered
 
 
@@ -824,21 +861,24 @@ def _regular_aligned_dot_groups(points, line_indices, center, axis):
     projections = np.asarray([item[0] for item in ordered], dtype=np.float64)
     point_indices = [item[1] for item in ordered]
     spacing_seeds = set()
+    # Nearby projection gaps include the true step and its 2x/3x skipped-dot
+    # versions; avoid generating every O(n²) pair distance inside each band.
     for first in range(len(projections) - 1):
-        for second in range(first + 1, len(projections)):
+        for second in range(first + 1, min(len(projections), first + 4)):
             distance = projections[second] - projections[first]
             for multiple in range(1, ALIGNED_DOT_MAX_GAP_MULTIPLE + 1):
                 spacing = distance / multiple
                 if ALIGNED_DOT_MIN_SPACING <= spacing <= ALIGNED_DOT_MAX_GAP:
-                    spacing_seeds.add(round(float(spacing), 1))
+                    spacing_seeds.add(int(round(float(spacing))))
 
+    anchor_indices = sorted({0, len(projections) // 2, len(projections) - 1})
     group_candidates = {}
     for spacing_seed in sorted(spacing_seeds):
-        for anchor in projections:
-            phase = float(anchor)
+        for anchor_index in anchor_indices:
+            phase = float(projections[anchor_index])
             spacing = float(spacing_seed)
             chosen = []
-            for _ in range(4):
+            for _ in range(3):
                 slot_candidates = {}
                 phase_tolerance = max(
                     ALIGNED_DOT_LATTICE_PHASE_TOLERANCE,
@@ -977,7 +1017,12 @@ def group_aligned_dot_candidates(candidates):
     coordinates = np.asarray(
         [[point["x"], point["y"]] for point in points], dtype=np.float64
     )
-    for first, second in itertools.combinations(range(len(points)), 2):
+    pair_hypotheses = (
+        itertools.combinations(range(len(points)), 2)
+        if len(points) <= ALIGNED_DOT_PAIR_HYPOTHESIS_MAX_POINTS
+        else ()
+    )
+    for first, second in pair_hypotheses:
         delta = coordinates[second] - coordinates[first]
         seed_distance = float(np.hypot(delta[0], delta[1]))
         if seed_distance < 24.0:

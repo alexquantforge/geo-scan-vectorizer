@@ -2,6 +2,8 @@ import csv
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 
 import cv2
@@ -11,7 +13,13 @@ from scripts.detect_lines import (
     filter_dot_candidates_near_lines,
     group_aligned_dot_candidates,
 )
-from scripts.detect_tile_lines import Tile, detect_tiles, draw_overlay, write_line_files
+from scripts.detect_tile_lines import (
+    Tile,
+    detect_tiles,
+    draw_overlay,
+    group_dot_candidates_in_windows,
+    write_line_files,
+)
 
 
 class AlignedDotDetectionTests(unittest.TestCase):
@@ -42,6 +50,21 @@ class AlignedDotDetectionTests(unittest.TestCase):
         self.assertEqual(
             filter_dot_candidates_near_lines(regular_points, [(0, 100, 350, 100)]), []
         )
+
+    def test_global_grouping_reports_window_progress(self) -> None:
+        candidates = [
+            {"x": float(x), "y": 100.0, "radius": 5.0, "area": 30}
+            for x in (30, 80, 130, 180, 230, 280)
+        ]
+        output = StringIO()
+        with redirect_stdout(output):
+            aligned_dots = group_dot_candidates_in_windows(
+                candidates, tile_size=500, report_progress=True
+            )
+
+        self.assertEqual(len(aligned_dots), 6)
+        self.assertIn("Глобальная группировка точек", output.getvalue())
+        self.assertIn("окно 1/", output.getvalue())
 
     def test_parallel_rows_allow_skipped_marks_but_keep_six_point_minimum(self) -> None:
         direction = np.array([0.4, 0.916515], dtype=np.float64)
@@ -87,6 +110,25 @@ class AlignedDotDetectionTests(unittest.TestCase):
                 for decoy in five_point_decoy
             )
         )
+
+    def test_dense_parallel_rows_are_grouped_without_pairwise_fallback(self) -> None:
+        direction = np.array([0.6, 0.8], dtype=np.float64)
+        normal = np.array([-direction[1], direction[0]])
+        candidates = []
+        for row in range(10):
+            for column in range(15):
+                center = np.array([800.0, 800.0]) + direction * 70 * column
+                center += normal * 100 * row
+                candidates.append(
+                    {
+                        "x": float(center[0]),
+                        "y": float(center[1]),
+                        "radius": 5.0,
+                        "area": 30,
+                    }
+                )
+
+        self.assertEqual(len(group_aligned_dot_candidates(candidates)), 150)
 
     def test_tiled_pipeline_groups_a_periodic_row_with_two_missing_marks(self) -> None:
         source_image = np.full((900, 1000, 3), 220, dtype=np.uint8)

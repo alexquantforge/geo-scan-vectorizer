@@ -25,9 +25,6 @@ try:
     # Running the file as a script puts its directory on sys.path.
     from detect_lines import (
         ALIGNED_DOT_MAX_GAP,
-        ALIGNED_DOT_MAX_GAP_MULTIPLE,
-        ALIGNED_DOT_MIN_COUNT,
-        ALIGNED_DOT_SPACING_REL_TOLERANCE,
         detect_all,
         filter_dot_candidates_near_lines,
         group_aligned_dot_candidates,
@@ -39,9 +36,6 @@ except ModuleNotFoundError as exc:  # pragma: no cover - script vs package impor
         # Package imports (for example, from tests) need a relative import.
         from .detect_lines import (
             ALIGNED_DOT_MAX_GAP,
-            ALIGNED_DOT_MAX_GAP_MULTIPLE,
-            ALIGNED_DOT_MIN_COUNT,
-            ALIGNED_DOT_SPACING_REL_TOLERANCE,
             detect_all,
             filter_dot_candidates_near_lines,
             group_aligned_dot_candidates,
@@ -176,20 +170,18 @@ def canonical_line_key(line: dict[str, Any]) -> tuple[Any, ...]:
 
 
 def group_dot_candidates_in_windows(
-    candidates: list[dict[str, float]], tile_size: int
+    candidates: list[dict[str, float]],
+    tile_size: int,
+    report_progress: bool = False,
 ) -> list[dict[str, float]]:
     """Group points in overlapping global windows so rows can cross tile seams."""
     if not candidates:
         return []
 
     stride = tile_size
-    maximum_observed_gap = (
-        ALIGNED_DOT_MAX_GAP
-        * ALIGNED_DOT_MAX_GAP_MULTIPLE
-        * (1.0 + ALIGNED_DOT_SPACING_REL_TOLERANCE)
-    )
-    minimum_row_span = (ALIGNED_DOT_MIN_COUNT - 1) * maximum_observed_gap
-    window_size = max(2 * tile_size, int(math.ceil(minimum_row_span)) + 1)
+    # Keep windows modest (1,181 px at the default tile size) so dense scans
+    # do not repeat expensive grouping too often; overlap still covers tile seams.
+    window_size = max(2 * tile_size, tile_size + 4 * ALIGNED_DOT_MAX_GAP + 1)
     windows: dict[tuple[int, int], list[dict[str, float]]] = {}
     windows_back = max(0, math.ceil(window_size / stride) - 1)
 
@@ -206,22 +198,54 @@ def group_dot_candidates_in_windows(
                     continue
                 windows.setdefault((x_start, y_start), []).append(candidate)
 
+    window_items = sorted(windows.items(), key=lambda item: (item[0][1], item[0][0]))
+    if report_progress:
+        print(
+            f"Глобальная группировка точек: {len(candidates)} кандидатов, "
+            f"{len(window_items)} окон {window_size}×{window_size} px.",
+            flush=True,
+        )
+
     aligned_dots = []
-    for window_candidates in windows.values():
+    dot_buckets: dict[tuple[int, int], list[int]] = {}
+    report_interval = max(1, math.ceil(len(window_items) / 20))
+    for window_index, ((x_start, y_start), window_candidates) in enumerate(
+        window_items, start=1
+    ):
         for dot in group_aligned_dot_candidates(window_candidates):
-            duplicate = next(
-                (
-                    existing
-                    for existing in aligned_dots
-                    if math.hypot(existing["x"] - dot["x"], existing["y"] - dot["y"])
-                    < 4.0
-                ),
-                None,
-            )
-            if duplicate is None:
+            cell_x = int(dot["x"] // 4)
+            cell_y = int(dot["y"] // 4)
+            duplicate_index = None
+            for bucket_x in range(cell_x - 1, cell_x + 2):
+                for bucket_y in range(cell_y - 1, cell_y + 2):
+                    for existing_index in dot_buckets.get((bucket_x, bucket_y), ()):
+                        existing = aligned_dots[existing_index]
+                        if math.hypot(
+                            existing["x"] - dot["x"], existing["y"] - dot["y"]
+                        ) < 4.0:
+                            duplicate_index = existing_index
+                            break
+                    if duplicate_index is not None:
+                        break
+                if duplicate_index is not None:
+                    break
+
+            if duplicate_index is None:
+                duplicate_index = len(aligned_dots)
                 aligned_dots.append(dot.copy())
-            elif dot["radius"] > duplicate["radius"]:
-                duplicate["radius"] = dot["radius"]
+                dot_buckets.setdefault((cell_x, cell_y), []).append(duplicate_index)
+            elif dot["radius"] > aligned_dots[duplicate_index]["radius"]:
+                aligned_dots[duplicate_index]["radius"] = dot["radius"]
+
+        if report_progress and (
+            window_index % report_interval == 0 or window_index == len(window_items)
+        ):
+            print(
+                f"Глобальная группировка: окно {window_index}/{len(window_items)} "
+                f"({x_start},{y_start}), кандидатов={len(window_candidates)}, "
+                f"точек найдено={len(aligned_dots)}.",
+                flush=True,
+            )
 
     return sorted(aligned_dots, key=lambda dot: (dot["y"], dot["x"]))
 
@@ -281,8 +305,13 @@ def detect_tiles(
             all_lines.append(record)
 
         if index % 25 == 0 or index == len(tiles):
-            print(f"Обработано тайлов: {index}/{len(tiles)}")
+            print(f"Обработано тайлов: {index}/{len(tiles)}", flush=True)
 
+    print(
+        f"Тайлы обработаны: сегментов={len(all_lines)}, "
+        f"кандидатов компактных точек={len(all_dot_candidates)}.",
+        flush=True,
+    )
     existing_line_segments = [
         (line["x1"], line["y1"], line["x2"], line["y2"])
         for line in all_lines
@@ -294,10 +323,37 @@ def detect_tiles(
         for candidate in all_dot_candidates
         if 0.0 <= candidate["x"] < width and 0.0 <= candidate["y"] < height
     ]
-    candidates_off_lines = filter_dot_candidates_near_lines(
-        in_bounds_dot_candidates, existing_line_segments
+    print(
+        f"Проверка точек по существующим линиям: "
+        f"кандидатов={len(in_bounds_dot_candidates)}, "
+        f"линейных сегментов={len(existing_line_segments)}.",
+        flush=True,
     )
-    aligned_dots = group_dot_candidates_in_windows(candidates_off_lines, tile_size)
+
+    def report_line_filter_progress(processed: int, total: int) -> None:
+        if total < 1000 and processed != total:
+            return
+        interval = max(1, total // 10)
+        if processed == total or processed % interval == 0:
+            print(f"Проверка линий: кандидаты {processed}/{total}.", flush=True)
+
+    candidates_off_lines = filter_dot_candidates_near_lines(
+        in_bounds_dot_candidates,
+        existing_line_segments,
+        progress_callback=report_line_filter_progress,
+    )
+    print(
+        f"После исключения точек на линиях осталось: "
+        f"{len(candidates_off_lines)} из {len(in_bounds_dot_candidates)}.",
+        flush=True,
+    )
+    aligned_dots = group_dot_candidates_in_windows(
+        candidates_off_lines, tile_size, report_progress=True
+    )
+    print(
+        f"Глобальная группировка завершена: {len(aligned_dots)} aligned_dot.",
+        flush=True,
+    )
     if aligned_dots:
         all_lines = [
             line
@@ -354,6 +410,7 @@ def draw_overlay(
     output_dir: Path,
 ) -> tuple[Path, Path]:
     height, width = source_image.shape[:2]
+    print(f"Наношу {len(lines)} объектов на полноразмерный скан...", flush=True)
     overlay = source_image.copy()
 
     for line in lines:
@@ -368,9 +425,11 @@ def draw_overlay(
             cv2.line(overlay, start, end, color, 2, cv2.LINE_AA)
 
     full_path = output_dir / "overlay.jpg"
+    print(f"Сохраняю полноразмерное наложение: {full_path}", flush=True)
     if not cv2.imwrite(str(full_path), overlay, [cv2.IMWRITE_JPEG_QUALITY, 95]):
         raise OSError(f"не удалось сохранить наложение: {full_path}")
 
+    print("Полноразмерное наложение сохранено. Подготавливаю превью...", flush=True)
     scale = min(1.0, preview_max_side / max(width, height))
     if scale < 1.0:
         preview_width = max(1, round(width * scale))
@@ -394,6 +453,7 @@ def draw_overlay(
         preview = overlay
 
     preview_path = output_dir / "overlay_preview.jpg"
+    print(f"Сохраняю превью: {preview_path}", flush=True)
     if not cv2.imwrite(
         str(preview_path), preview, [cv2.IMWRITE_JPEG_QUALITY, 92]
     ):
@@ -469,12 +529,18 @@ def run(
 
     lines = detect_tiles(tiles, width, height, tile_size)
     output_dir.mkdir(parents=True, exist_ok=True)
+    print("Записываю координаты в JSON и CSV...", flush=True)
     json_path, csv_path = write_line_files(
         output_dir, image_path, tiles_dir, width, height, len(tiles), lines
+    )
+    print(
+        "Координаты записаны. Создаю полноразмерное наложение и превью...",
+        flush=True,
     )
     overlay_path, preview_path = draw_overlay(
         source_image, lines, preview_max_side, output_dir
     )
+    print("Наложение и превью сохранены.", flush=True)
 
     print(f"Найдено объектов: {len(lines)}")
     for line_type, count in sorted(Counter(line["type"] for line in lines).items()):
