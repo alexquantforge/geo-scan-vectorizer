@@ -4,10 +4,13 @@ import itertools
 import numpy as np
 from pathlib import Path
 
-ALIGNED_DOT_MIN_COUNT = 5
-ALIGNED_DOT_TOLERANCE = 6.0
+ALIGNED_DOT_MIN_COUNT = 6
+ALIGNED_DOT_TOLERANCE = 4.0
 ALIGNED_DOT_MAX_GAP = 110.0
 ALIGNED_DOT_MIN_SPAN = 40.0
+ALIGNED_DOT_SPACING_REL_TOLERANCE = 0.22
+ALIGNED_DOT_SPACING_MAX_CV = 0.15
+ALIGNED_DOT_MIN_SPACING = 20.0
 DOT_CANDIDATE_MERGE_DISTANCE = 9.0
 
 
@@ -524,6 +527,15 @@ def detect_dot_candidates(tile, gray):
     dot_gray = gray.copy()
     dot_gray[colored_overlay > 0] = 255
     dot_gray = cv2.GaussianBlur(dot_gray, (3, 3), 0)
+    padding = 20
+    dot_gray = cv2.copyMakeBorder(
+        dot_gray,
+        padding,
+        padding,
+        padding,
+        padding,
+        cv2.BORDER_REFLECT_101,
+    )
     binary = np.where(dot_gray <= 80, 255, 0).astype(np.uint8)
     binary = cv2.morphologyEx(
         binary,
@@ -565,13 +577,47 @@ def detect_dot_candidates(tile, gray):
 
         candidates.append(
             {
-                "x": float(centroids[label][0]),
-                "y": float(centroids[label][1]),
+                "x": float(centroids[label][0]) - padding,
+                "y": float(centroids[label][1]) - padding,
                 "radius": max(2.5, max_dimension / 2.0 + 1.0),
                 "area": area,
             }
         )
     return candidates
+
+
+def filter_dot_candidates_near_lines(candidates, line_segments):
+    """Discard point centers that overlap an existing detected line segment."""
+    if not line_segments:
+        return candidates
+
+    filtered = []
+    for candidate in candidates:
+        threshold = max(3.0, candidate["radius"] * 0.5)
+        on_line = False
+        for x1, y1, x2, y2 in line_segments:
+            delta_x = x2 - x1
+            delta_y = y2 - y1
+            segment_length_squared = delta_x * delta_x + delta_y * delta_y
+            if segment_length_squared == 0:
+                distance = float(np.hypot(candidate["x"] - x1, candidate["y"] - y1))
+            else:
+                projection = (
+                    (candidate["x"] - x1) * delta_x
+                    + (candidate["y"] - y1) * delta_y
+                ) / segment_length_squared
+                projection = min(1.0, max(0.0, projection))
+                nearest_x = x1 + projection * delta_x
+                nearest_y = y1 + projection * delta_y
+                distance = float(
+                    np.hypot(candidate["x"] - nearest_x, candidate["y"] - nearest_y)
+                )
+            if distance <= threshold:
+                on_line = True
+                break
+        if not on_line:
+            filtered.append(candidate)
+    return filtered
 
 
 def merge_dot_candidates(candidates):
@@ -623,7 +669,7 @@ def merge_dot_candidates(candidates):
 
 
 def group_aligned_dot_candidates(candidates):
-    """Return the individual dot centers in near-straight groups of at least five."""
+    """Return dot centers in near-straight, equally spaced groups of at least six."""
     points = merge_dot_candidates(candidates)
     if len(points) < ALIGNED_DOT_MIN_COUNT:
         return []
@@ -638,11 +684,29 @@ def group_aligned_dot_candidates(candidates):
     def add_chunk(chunk):
         if len(chunk) < ALIGNED_DOT_MIN_COUNT:
             return
-        span = chunk[-1][0] - chunk[0][0]
-        if span < min_span:
-            return
-        indices = tuple(sorted(point_index for _, point_index in chunk))
-        group_candidates[indices] = max(group_candidates.get(indices, 0.0), span)
+        for start in range(len(chunk) - ALIGNED_DOT_MIN_COUNT + 1):
+            for end in range(start + ALIGNED_DOT_MIN_COUNT, len(chunk) + 1):
+                run = chunk[start:end]
+                projections = [projection for projection, _ in run]
+                gaps = np.diff(projections)
+                median_gap = float(np.median(gaps))
+                if median_gap < ALIGNED_DOT_MIN_SPACING:
+                    continue
+                relative_deviation = float(
+                    np.max(np.abs(gaps - median_gap)) / median_gap
+                )
+                spacing_cv = float(np.std(gaps) / np.mean(gaps))
+                span = projections[-1] - projections[0]
+                if (
+                    span < min_span
+                    or relative_deviation > ALIGNED_DOT_SPACING_REL_TOLERANCE
+                    or spacing_cv > ALIGNED_DOT_SPACING_MAX_CV
+                ):
+                    continue
+                indices = tuple(sorted(point_index for _, point_index in run))
+                group_candidates[indices] = max(
+                    group_candidates.get(indices, 0.0), span
+                )
 
     for first, second in itertools.combinations(range(len(points)), 2):
         first_point = points[first]
@@ -682,7 +746,7 @@ def group_aligned_dot_candidates(candidates):
     for indices, _ in ordered_groups:
         index_set = set(indices)
         if any(
-            len(index_set & set(accepted)) / min(len(indices), len(accepted)) >= 0.8
+            len(index_set & set(accepted)) / min(len(indices), len(accepted)) >= 0.95
             for accepted in accepted_groups
         ):
             continue
@@ -696,7 +760,7 @@ def group_aligned_dot_candidates(candidates):
 
 
 def detect_aligned_dots(tile, gray):
-    """Return compact dark marks belonging to a near-straight row of 5+ dots."""
+    """Return compact dark marks in a near-straight row of 6+ dots."""
     return [
         (point["x"], point["y"], point["radius"])
         for point in group_aligned_dot_candidates(detect_dot_candidates(tile, gray))
@@ -759,7 +823,15 @@ def detect_all(tile, x0,y0, dot_candidates_out=None):
                 y2,
             )
         )
-    dot_candidates = detect_dot_candidates(tile, gray)
+    line_segments = [
+        tuple(float(value) for value in candidate[7:11])
+        for candidate in out
+        if candidate[6] in {"straight", "curved", "dashed_curve"}
+        and candidate[4] >= 35.0
+    ]
+    dot_candidates = filter_dot_candidates_near_lines(
+        detect_dot_candidates(tile, gray), line_segments
+    )
     if dot_candidates_out is None:
         aligned_dots = [
             (point["x"], point["y"], point["radius"])

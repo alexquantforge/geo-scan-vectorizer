@@ -26,6 +26,7 @@ try:
     from detect_lines import (
         ALIGNED_DOT_MAX_GAP,
         detect_all,
+        filter_dot_candidates_near_lines,
         group_aligned_dot_candidates,
     )
 except ModuleNotFoundError as exc:  # pragma: no cover - script vs package import
@@ -36,6 +37,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - script vs package impor
         from .detect_lines import (
             ALIGNED_DOT_MAX_GAP,
             detect_all,
+            filter_dot_candidates_near_lines,
             group_aligned_dot_candidates,
         )
     except ImportError as relative_exc:  # pragma: no cover - depends on invocation
@@ -269,7 +271,16 @@ def detect_tiles(
         if index % 25 == 0 or index == len(tiles):
             print(f"Обработано тайлов: {index}/{len(tiles)}")
 
-    aligned_dots = group_dot_candidates_in_windows(all_dot_candidates, tile_size)
+    existing_line_segments = [
+        (line["x1"], line["y1"], line["x2"], line["y2"])
+        for line in all_lines
+        if line["type"] in {"straight", "curved", "dashed_curve"}
+        and line["length"] >= 35.0
+    ]
+    candidates_off_lines = filter_dot_candidates_near_lines(
+        all_dot_candidates, existing_line_segments
+    )
+    aligned_dots = group_dot_candidates_in_windows(candidates_off_lines, tile_size)
     if aligned_dots:
         all_lines = [
             line

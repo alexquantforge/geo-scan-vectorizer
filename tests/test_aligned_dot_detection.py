@@ -7,11 +7,31 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from scripts.detect_lines import (
+    filter_dot_candidates_near_lines,
+    group_aligned_dot_candidates,
+)
 from scripts.detect_tile_lines import Tile, detect_tiles, draw_overlay, write_line_files
 
 
 class AlignedDotDetectionTests(unittest.TestCase):
-    def test_tiled_pipeline_marks_every_dot_in_rows_of_five_or_more(self) -> None:
+    def test_equal_spacing_and_distance_from_existing_line_are_required(self) -> None:
+        regular_points = [
+            {"x": float(x), "y": 100.0, "radius": 5.0, "area": 30}
+            for x in (30, 80, 130, 180, 230, 280)
+        ]
+        irregular_points = [
+            {"x": float(x), "y": 180.0, "radius": 5.0, "area": 30}
+            for x in (30, 70, 130, 180, 250, 300)
+        ]
+
+        self.assertEqual(len(group_aligned_dot_candidates(regular_points)), 6)
+        self.assertEqual(group_aligned_dot_candidates(irregular_points), [])
+        self.assertEqual(
+            filter_dot_candidates_near_lines(regular_points, [(0, 100, 350, 100)]), []
+        )
+
+    def test_tiled_pipeline_requires_six_regular_points(self) -> None:
         tile_image = np.full((500, 500, 3), 220, dtype=np.uint8)
         aligned_centers = [
             (50, 50),
@@ -19,9 +39,11 @@ class AlignedDotDetectionTests(unittest.TestCase):
             (130, 130),
             (170, 171),
             (210, 210),
+            (250, 250),
         ]
-        four_point_row = [(60, 350), (105, 350), (150, 350), (195, 350)]
-        for center in aligned_centers + four_point_row:
+        five_point_row = [(50, 350), (100, 350), (150, 350), (200, 350), (250, 350)]
+        four_point_row = [(60, 430), (110, 430), (160, 430), (210, 430)]
+        for center in aligned_centers + five_point_row + four_point_row:
             cv2.circle(tile_image, center, 6, (10, 10, 10), 2, cv2.LINE_AA)
 
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -89,13 +111,19 @@ class AlignedDotDetectionTests(unittest.TestCase):
             self.assertTrue(preview_path.is_file())
 
     def test_row_crossing_tile_boundary_is_grouped_globally(self) -> None:
-        left_image = np.full((500, 500, 3), 220, dtype=np.uint8)
-        right_image = np.full((500, 500, 3), 220, dtype=np.uint8)
-        global_centers = [(400, 100), (455, 127), (510, 154), (565, 181), (620, 208)]
-        for global_x, y in global_centers:
-            image = left_image if global_x < 500 else right_image
-            x = global_x if global_x < 500 else global_x - 500
-            cv2.circle(image, (x, y), 6, (10, 10, 10), 2, cv2.LINE_AA)
+        source_image = np.full((500, 1000, 3), 220, dtype=np.uint8)
+        global_centers = [
+            (350, 100),
+            (400, 125),
+            (450, 150),
+            (500, 175),
+            (550, 200),
+            (600, 225),
+        ]
+        for center in global_centers:
+            cv2.circle(source_image, center, 6, (10, 10, 10), 2, cv2.LINE_AA)
+        left_image = source_image[:, :500]
+        right_image = source_image[:, 500:]
 
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
