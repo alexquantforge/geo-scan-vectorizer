@@ -71,6 +71,26 @@ class DashedCurveDetectionTests(unittest.TestCase):
         self.assertTrue(neutral_ink_lines)
         self.assertFalse(blue_overlay_lines)
 
+    def test_thin_wavy_ink_is_detected_on_cyan_background(self) -> None:
+        image = np.full((300, 300, 3), (240, 230, 210), dtype=np.uint8)
+        points = np.array(
+            [
+                (round(130 + 25 * np.sin(y / 32)), y)
+                for y in range(12, 290, 2)
+            ],
+            dtype=np.int32,
+        ).reshape(-1, 1, 2)
+        cv2.polylines(image, [points], False, (10, 10, 10), 3, cv2.LINE_AA)
+        cv2.line(image, (0, 145), (299, 145), (25, 25, 25), 1, cv2.LINE_AA)
+
+        detections = detect_all(image, 0, 0)
+        curves = [line for line in detections if line[6] == "curved"]
+        self.assertGreaterEqual(len(curves), 8)
+        for line in curves:
+            for x, y in ((line[0], line[1]), (line[2], line[3])):
+                expected_x = 130 + 25 * np.sin(y / 32)
+                self.assertLess(abs(x - expected_x), 15)
+
     def test_grid_and_text_alone_do_not_form_a_dashed_curve(self) -> None:
         image = self.make_scan(with_curve=False)
         detections = detect_all(image, 0, 0)

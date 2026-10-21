@@ -258,6 +258,8 @@ def detect_all(tile, x0,y0):
     clahe=cv2.createCLAHE(2.0,(8,8)); eq=clahe.apply(gray)
     th=cv2.adaptiveThreshold(eq,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY_INV,41,12)
     edges=cv2.Canny(cv2.morphologyEx(th,cv2.MORPH_OPEN, np.ones((3,3),np.uint8)),50,150)
+    # A smaller opening preserves thin strokes for the curved-contour pass.
+    curve_edges=cv2.Canny(cv2.morphologyEx(th,cv2.MORPH_OPEN, np.ones((2,2),np.uint8)),50,150)
     out=[]
     lsd=cv2.createLineSegmentDetector()
     lines,_,_,_=lsd.detect(gray)
@@ -273,7 +275,7 @@ def detect_all(tile, x0,y0):
             length=float(np.hypot(x2-x1,y2-y1)); ang=float(np.degrees(np.arctan2(y2-y1,x2-x1)))
             if not line_has_dark_support(ink_support,x1,y1,x2,y2): continue
             out.append((x1+x0,y1+y0,x2+x0,y2+y0,length,ang,"straight", float(x1),float(y1),float(x2),float(y2)))
-    contours,_=cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    contours,_=cv2.findContours(curve_edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     for cnt in contours:
         if cv2.arcLength(cnt, False) < 80: continue
         approx=cv2.approxPolyDP(cnt, 2.0, False)
