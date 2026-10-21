@@ -247,6 +247,128 @@ def detect_dashed_curve_segments(gray, binary):
     return segments
 
 
+def detect_small_circles(gray, binary):
+    """Find small, closed ring symbols while rejecting isolated texture specks.
+
+    A candidate must have a nearly circular outer contour, a centered circular
+    hole, and dark-pixel support around its annulus. The hole test prevents solid
+    blobs from being mistaken for rings; non-maximum suppression removes nested
+    contour duplicates.
+    """
+    closed = cv2.morphologyEx(
+        binary,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+    )
+    contours, hierarchy = cv2.findContours(
+        closed, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
+    )
+    if hierarchy is None:
+        return []
+
+    hierarchy = hierarchy[0]
+    candidates = []
+    for index, contour in enumerate(contours):
+        child_index = int(hierarchy[index][2])
+        if child_index < 0:
+            continue
+
+        outer_area = float(cv2.contourArea(contour))
+        outer_perimeter = float(cv2.arcLength(contour, True))
+        if outer_area <= 0 or outer_perimeter <= 0:
+            continue
+        outer_circularity = 4 * np.pi * outer_area / (outer_perimeter ** 2)
+        _, _, box_width, box_height = cv2.boundingRect(contour)
+        aspect_ratio = max(box_width, box_height) / max(1, min(box_width, box_height))
+        (outer_x, outer_y), outer_radius = cv2.minEnclosingCircle(contour)
+        if not (
+            7.0 <= outer_radius <= 20.0
+            and aspect_ratio <= 1.4
+            and outer_circularity >= 0.5
+        ):
+            continue
+
+        matching_holes = []
+        while child_index >= 0:
+            hole = contours[child_index]
+            hole_area = float(cv2.contourArea(hole))
+            hole_perimeter = float(cv2.arcLength(hole, True))
+            if hole_area > 0 and hole_perimeter > 0:
+                hole_circularity = 4 * np.pi * hole_area / (hole_perimeter ** 2)
+                _, _, hole_width, hole_height = cv2.boundingRect(hole)
+                hole_aspect = max(hole_width, hole_height) / max(
+                    1, min(hole_width, hole_height)
+                )
+                (inner_x, inner_y), inner_radius = cv2.minEnclosingCircle(hole)
+                center_offset = float(np.hypot(inner_x - outer_x, inner_y - outer_y))
+                radius_ratio = inner_radius / max(outer_radius, 1.0)
+                if (
+                    0.25 <= radius_ratio <= 0.75
+                    and center_offset <= 4.0
+                    and hole_aspect <= 1.5
+                    and hole_circularity >= 0.3
+                ):
+                    matching_holes.append(
+                        (
+                            hole_circularity
+                            - 0.05 * center_offset
+                            - abs(radius_ratio - 0.5),
+                            inner_x,
+                            inner_y,
+                            inner_radius,
+                            center_offset,
+                            radius_ratio,
+                        )
+                    )
+            child_index = int(hierarchy[child_index][0])
+
+        if not matching_holes:
+            continue
+        hole_score, inner_x, inner_y, inner_radius, center_offset, radius_ratio = max(
+            matching_holes, key=lambda item: item[0]
+        )
+
+        center_x = (outer_x + inner_x) / 2.0
+        center_y = (outer_y + inner_y) / 2.0
+        radius = (outer_radius + inner_radius) / 2.0 + 1.0
+        support_radius = radius - 0.8
+        supported_angles = 0
+        sample_count = 48
+        for angle in np.linspace(0, 2 * np.pi, sample_count, endpoint=False):
+            sample_x = int(round(center_x + support_radius * np.cos(angle)))
+            sample_y = int(round(center_y + support_radius * np.sin(angle)))
+            y_start, y_end = max(0, sample_y - 2), min(gray.shape[0], sample_y + 3)
+            x_start, x_end = max(0, sample_x - 2), min(gray.shape[1], sample_x + 3)
+            patch = gray[y_start:y_end, x_start:x_end]
+            if patch.size and np.any(patch <= 110):
+                supported_angles += 1
+
+        dark_support = supported_angles / sample_count
+        if dark_support < 0.5:
+            continue
+
+        score = (
+            outer_circularity
+            + dark_support
+            + 0.1 * hole_score
+            - 0.05 * center_offset
+            - 0.2 * abs(radius_ratio - 0.5)
+        )
+        candidates.append((score, center_x, center_y, radius))
+
+    candidates.sort(key=lambda candidate: candidate[0], reverse=True)
+    circles = []
+    for _, center_x, center_y, radius in candidates:
+        if any(
+            np.hypot(center_x - other_x, center_y - other_y) < 5.0
+            and abs(radius - other_radius) < 3.0
+            for other_x, other_y, other_radius in circles
+        ):
+            continue
+        circles.append((center_x, center_y, radius))
+    return circles
+
+
 def detect_all(tile, x0,y0):
     # Ignore colored blue/cyan marks, but retain dark neutral ink on cyan paper.
     blue_mask = blue_cyan_mask(tile)
@@ -303,6 +425,24 @@ def detect_all(tile, x0,y0):
                 y2,
             )
         )
+    for center_x, center_y, radius in detect_small_circles(gray, th):
+        global_x, global_y = center_x + x0, center_y + y0
+        out.append(
+            (
+                global_x,
+                global_y,
+                global_x,
+                global_y,
+                2 * np.pi * radius,
+                0.0,
+                "small_circle",
+                center_x,
+                center_y,
+                center_x,
+                center_y,
+                radius,
+            )
+        )
     return out
 
 def main():
@@ -323,32 +463,41 @@ def main():
         "straight": (0, 0, 255),
         "curved": (0, 255, 0),
         "dashed_curve": (255, 0, 255),
+        "small_circle": (0, 255, 255),
     }
     for tile,x0,y0,tid in tiles:
         cand=detect_all(tile,x0,y0)
         filtered=[]
-        for x1,y1,x2,y2,length,ang,typ,lx1,ly1,lx2,ly2 in cand:
-            key=(round(x1/2),round(y1/2),round(x2/2),round(y2/2),typ)
+        for candidate in cand:
+            x1,y1,x2,y2,length,ang,typ,lx1,ly1,lx2,ly2 = candidate[:11]
+            radius = candidate[11] if len(candidate) > 11 else None
+            if typ == "small_circle":
+                key=(typ,round(x1/2),round(y1/2),round(radius/2))
+            else:
+                key=(round(x1/2),round(y1/2),round(x2/2),round(y2/2),typ)
             if key in seen: continue
             seen.add(key)
-            filtered.append({"x1":int(x1),"y1":int(y1),"x2":int(x2),"y2":int(y2),"length":round(length,1),"angle":round(ang,1),"type":typ,"tile":tid})
+            filtered.append({"x1":int(x1),"y1":int(y1),"x2":int(x2),"y2":int(y2),"length":round(length,1),"angle":round(ang,1),"type":typ,"tile":tid,"radius":None if radius is None else round(float(radius),1)})
         all_lines.extend(filtered)
-        counts = {kind: sum(line["type"] == kind for line in filtered) for kind in ("straight", "curved", "dashed_curve")}
-        print(f"  {tid}: straight {counts['straight']} curved {counts['curved']} dashed_curve {counts['dashed_curve']}")
+        counts = {kind: sum(line["type"] == kind for line in filtered) for kind in ("straight", "curved", "dashed_curve", "small_circle")}
+        print(f"  {tid}: straight {counts['straight']} curved {counts['curved']} dashed_curve {counts['dashed_curve']} small_circle {counts['small_circle']}")
         dbg=tile.copy()
         for f in filtered:
             lx1,ly1=f["x1"]-x0, f["y1"]-y0; lx2,ly2=f["x2"]-x0, f["y2"]-y0
             col = colors.get(f["type"], (0, 0, 255))
-            cv2.line(dbg,(int(lx1),int(ly1)),(int(lx2),int(ly2)),col,2)
+            if f["type"] == "small_circle":
+                cv2.circle(dbg,(int(lx1),int(ly1)),max(1,int(round(f["radius"]))),col,2,cv2.LINE_AA)
+            else:
+                cv2.line(dbg,(int(lx1),int(ly1)),(int(lx2),int(ly2)),col,2)
         cv2.imwrite(os.path.join(args.debug_dir, f"debug_{tid}.jpg"), dbg)
     all_lines=sorted(all_lines, key=lambda x: x["length"], reverse=True)
     with open(args.output,"w",encoding="utf-8") as f: json.dump({"image":args.image,"image_size":{"W":W,"H":H,"origin":"top-left"},"tiling":args.tiles,"lines_count":len(all_lines),"lines":all_lines}, f, ensure_ascii=False, indent=2)
-    print(f"\nГотово! {len(all_lines)} отрезков (будет много цифр как просил)")
+    print(f"\nГотово! Найдено объектов: {len(all_lines)}")
     from collections import Counter; print(Counter(x["type"] for x in all_lines))
     csv=Path(args.output).with_suffix(".csv")
     with open(csv,"w",encoding="utf-8") as f:
-        f.write("x1,y1,x2,y2,length,angle,type,tile\n")
-        for l in all_lines: f.write(f"{l['x1']},{l['y1']},{l['x2']},{l['y2']},{l['length']},{l['angle']},{l['type']},{l['tile']}\n")
+        f.write("x1,y1,x2,y2,length,angle,type,tile,radius\n")
+        for l in all_lines: f.write(f"{l['x1']},{l['y1']},{l['x2']},{l['y2']},{l['length']},{l['angle']},{l['type']},{l['tile']},{l['radius']}\n")
     print(f"CSV: {csv}")
 
 if __name__=="__main__": main()

@@ -97,5 +97,37 @@ class DashedCurveDetectionTests(unittest.TestCase):
         self.assertFalse(any(line[6] == "dashed_curve" for line in detections))
 
 
+class SmallCircleDetectionTests(unittest.TestCase):
+    def test_finds_closed_ring_symbols_and_rejects_specks(self) -> None:
+        image = np.full((500, 500, 3), 220, dtype=np.uint8)
+        expected_centers = [(80, 100), (220, 260), (390, 400)]
+        for center, radius in zip(expected_centers, (8, 7, 9)):
+            cv2.circle(image, center, radius, (10, 10, 10), 2, cv2.LINE_AA)
+
+        # Grid ink, solid specks, and a ring too small to be a target symbol.
+        cv2.line(image, (0, 200), (499, 200), (20, 20, 20), 2, cv2.LINE_AA)
+        for center in ((130, 120), (300, 330), (450, 80)):
+            cv2.circle(image, center, 1, (15, 15, 15), -1, cv2.LINE_AA)
+        cv2.circle(image, (320, 100), 3, (10, 10, 10), 1, cv2.LINE_AA)
+
+        x_offset, y_offset = 500, 100
+        detections = detect_all(image, x_offset, y_offset)
+        circles = [item for item in detections if item[6] == "small_circle"]
+        self.assertEqual(len(circles), len(expected_centers))
+
+        actual_centers = sorted((item[0], item[1]) for item in circles)
+        expected_global = sorted(
+            (x + x_offset, y + y_offset) for x, y in expected_centers
+        )
+        for actual, expected in zip(actual_centers, expected_global):
+            self.assertLess(np.hypot(actual[0] - expected[0], actual[1] - expected[1]), 2)
+
+        for circle in circles:
+            self.assertEqual(circle[0], circle[2])
+            self.assertEqual(circle[1], circle[3])
+            self.assertGreaterEqual(circle[11], 7)
+            self.assertLessEqual(circle[11], 12)
+
+
 if __name__ == "__main__":
     unittest.main()

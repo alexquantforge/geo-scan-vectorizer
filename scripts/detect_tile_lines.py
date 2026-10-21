@@ -21,13 +21,19 @@ except ImportError as exc:  # pragma: no cover - depends on the user's environme
     ) from exc
 
 try:
-    # Reuse the detector from detect_lines.py so line-finding behavior stays consistent.
+    # Running the file as a script puts its directory on sys.path.
     from detect_lines import detect_all
-except ImportError as exc:  # pragma: no cover - depends on the user's environment
-    raise SystemExit(
-        "Не удалось загрузить scripts/detect_lines.py. "
-        "Запускайте скрипт из репозитория или через PyCharm."
-    ) from exc
+except ModuleNotFoundError as exc:  # pragma: no cover - script vs package import
+    if exc.name != "detect_lines":
+        raise
+    try:
+        # Package imports (for example, from tests) need a relative import.
+        from .detect_lines import detect_all
+    except ImportError as relative_exc:  # pragma: no cover - depends on invocation
+        raise SystemExit(
+            "Не удалось загрузить scripts/detect_lines.py. "
+            "Запускайте скрипт из репозитория или через PyCharm."
+        ) from relative_exc
 
 
 DEFAULT_IMAGE = Path(
@@ -45,6 +51,7 @@ LINE_COLORS = {
     "straight": (0, 0, 255),      # red
     "curved": (0, 255, 0),        # green
     "dashed_curve": (255, 0, 255),  # magenta
+    "small_circle": (0, 255, 255),  # yellow
 }
 
 
@@ -136,7 +143,14 @@ def validate_tiles(tiles: list[Tile], width: int, height: int, tile_size: int) -
 
 
 def canonical_line_key(line: dict[str, Any]) -> tuple[Any, ...]:
-    """Deduplicate near-identical detections, including reversed endpoints."""
+    """Deduplicate near-identical segments or circle centers and radii."""
+    if line["type"] == "small_circle":
+        return (
+            line["type"],
+            round(line["x1"] / 2),
+            round(line["y1"] / 2),
+            round(line["radius"] / 2),
+        )
     p1 = (round(line["x1"] / 2), round(line["y1"] / 2))
     p2 = (round(line["x2"] / 2), round(line["y2"] / 2))
     endpoints = tuple(sorted((p1, p2)))
@@ -169,6 +183,7 @@ def detect_tiles(
 
         for candidate in candidates:
             x1, y1, x2, y2, length, angle, line_type = candidate[:7]
+            radius = float(candidate[11]) if len(candidate) > 11 else None
             record = {
                 "x1": max(0, min(width - 1, int(round(x1)))),
                 "y1": max(0, min(height - 1, int(round(y1)))),
@@ -178,6 +193,7 @@ def detect_tiles(
                 "angle": round(float(angle), 1),
                 "type": str(line_type),
                 "tile": tile_info.path.name,
+                "radius": None if radius is None else round(radius, 1),
             }
             key = canonical_line_key(record)
             if key in seen:
@@ -207,7 +223,12 @@ def draw_overlay(
         color = LINE_COLORS.get(line["type"], (0, 0, 255))
         start = (line["x1"], line["y1"])
         end = (line["x2"], line["y2"])
-        cv2.line(overlay, start, end, color, 2, cv2.LINE_AA)
+        if line["type"] == "small_circle":
+            radius = max(1, int(round(line["radius"])))
+            cv2.circle(overlay, start, radius, (0, 0, 0), 4, cv2.LINE_AA)
+            cv2.circle(overlay, start, radius, color, 2, cv2.LINE_AA)
+        else:
+            cv2.line(overlay, start, end, color, 2, cv2.LINE_AA)
 
     full_path = output_dir / "overlay.jpg"
     if not cv2.imwrite(str(full_path), overlay, [cv2.IMWRITE_JPEG_QUALITY, 95]):
@@ -226,7 +247,12 @@ def draw_overlay(
             color = LINE_COLORS.get(line["type"], (0, 0, 255))
             start = (round(line["x1"] * scale), round(line["y1"] * scale))
             end = (round(line["x2"] * scale), round(line["y2"] * scale))
-            cv2.line(preview, start, end, color, 2, cv2.LINE_AA)
+            if line["type"] == "small_circle":
+                radius = max(1, round(line["radius"] * scale))
+                cv2.circle(preview, start, radius, (0, 0, 0), 4, cv2.LINE_AA)
+                cv2.circle(preview, start, radius, color, 2, cv2.LINE_AA)
+            else:
+                cv2.line(preview, start, end, color, 2, cv2.LINE_AA)
     else:
         preview = overlay
 
@@ -266,7 +292,7 @@ def write_line_files(
     with csv_path.open("w", encoding="utf-8-sig", newline="") as file:
         writer = csv.DictWriter(
             file,
-            fieldnames=["id", "x1", "y1", "x2", "y2", "length", "angle", "type", "tile"],
+            fieldnames=["id", "x1", "y1", "x2", "y2", "length", "angle", "type", "tile", "radius"],
         )
         writer.writeheader()
         writer.writerows(lines)
@@ -313,14 +339,14 @@ def run(
         source_image, lines, preview_max_side, output_dir
     )
 
-    print(f"Найдено отрезков: {len(lines)}")
+    print(f"Найдено объектов: {len(lines)}")
     for line_type, count in sorted(Counter(line["type"] for line in lines).items()):
         print(f"  {line_type}: {count}")
     print(f"JSON: {json_path}")
     print(f"CSV: {csv_path}")
     print(f"Полноразмерное наложение: {overlay_path}")
     print(f"Превью: {preview_path}")
-    print("Цвета: straight — красный, curved — зелёный, dashed_curve — пурпурный.")
+    print("Цвета: straight — красный, curved — зелёный, dashed_curve — пурпурный, small_circle — жёлтый.")
 
 
 def main() -> int:
