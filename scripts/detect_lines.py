@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
 import cv2, json, argparse, os, re
+import itertools
 import numpy as np
 from pathlib import Path
+
+ALIGNED_DOT_MIN_COUNT = 5
+ALIGNED_DOT_TOLERANCE = 6.0
+ALIGNED_DOT_MAX_GAP = 110.0
+ALIGNED_DOT_MIN_SPAN = 40.0
+DOT_CANDIDATE_MERGE_DISTANCE = 9.0
+
 
 def split_into_tiles(img, cols, rows, overlap):
     H,W=img.shape[:2]
@@ -505,7 +513,197 @@ def detect_small_circles(gray, binary):
     return circles
 
 
-def detect_all(tile, x0,y0):
+def detect_dot_candidates(tile, gray):
+    """Extract compact dark components before checking whether they form a row."""
+    hsv = cv2.cvtColor(tile, cv2.COLOR_BGR2HSV)
+    colored_overlay = (hsv[:, :, 1] > 90) & (hsv[:, :, 2] > 60)
+    colored_overlay = cv2.dilate(
+        colored_overlay.astype(np.uint8), np.ones((3, 3), np.uint8), iterations=1
+    )
+
+    dot_gray = gray.copy()
+    dot_gray[colored_overlay > 0] = 255
+    dot_gray = cv2.GaussianBlur(dot_gray, (3, 3), 0)
+    binary = np.where(dot_gray <= 80, 255, 0).astype(np.uint8)
+    binary = cv2.morphologyEx(
+        binary,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+    )
+
+    component_count, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        binary, connectivity=8
+    )
+    candidates = []
+    for label in range(1, component_count):
+        x, y, width, height, area = (int(value) for value in stats[label])
+        max_dimension = max(width, height)
+        min_dimension = min(width, height)
+        aspect_ratio = max_dimension / max(1, min_dimension)
+        if not (
+            4 <= max_dimension <= 18
+            and 3 <= min_dimension <= 16
+            and 12 <= area <= 180
+            and aspect_ratio <= 2.0
+        ):
+            continue
+
+        component = (labels[y : y + height, x : x + width] == label).astype(np.uint8) * 255
+        contours, _ = cv2.findContours(
+            component, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        if not contours:
+            continue
+        contour = max(contours, key=cv2.contourArea)
+        perimeter = float(cv2.arcLength(contour, True))
+        if perimeter <= 0:
+            continue
+        circularity = 4 * np.pi * float(cv2.contourArea(contour)) / perimeter**2
+        fill_ratio = area / float(width * height)
+        if circularity < 0.15 or fill_ratio < 0.25:
+            continue
+
+        candidates.append(
+            {
+                "x": float(centroids[label][0]),
+                "y": float(centroids[label][1]),
+                "radius": max(2.5, max_dimension / 2.0 + 1.0),
+                "area": area,
+            }
+        )
+    return candidates
+
+
+def merge_dot_candidates(candidates):
+    """Merge nearby component fragments so one printed mark counts as one dot."""
+    if not candidates:
+        return []
+
+    parents = list(range(len(candidates)))
+
+    def find_root(index):
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    for first, second in itertools.combinations(range(len(candidates)), 2):
+        first_candidate = candidates[first]
+        second_candidate = candidates[second]
+        distance = float(
+            np.hypot(
+                first_candidate["x"] - second_candidate["x"],
+                first_candidate["y"] - second_candidate["y"],
+            )
+        )
+        if distance <= DOT_CANDIDATE_MERGE_DISTANCE:
+            first_root = find_root(first)
+            second_root = find_root(second)
+            if first_root != second_root:
+                parents[second_root] = first_root
+
+    clusters = {}
+    for index, candidate in enumerate(candidates):
+        clusters.setdefault(find_root(index), []).append(candidate)
+
+    merged = []
+    for cluster in clusters.values():
+        total_area = sum(candidate["area"] for candidate in cluster)
+        merged.append(
+            {
+                "x": sum(candidate["x"] * candidate["area"] for candidate in cluster)
+                / total_area,
+                "y": sum(candidate["y"] * candidate["area"] for candidate in cluster)
+                / total_area,
+                "radius": max(candidate["radius"] for candidate in cluster),
+                "area": total_area,
+            }
+        )
+    return merged
+
+
+def group_aligned_dot_candidates(candidates):
+    """Return the individual dot centers in near-straight groups of at least five."""
+    points = merge_dot_candidates(candidates)
+    if len(points) < ALIGNED_DOT_MIN_COUNT:
+        return []
+
+    # Pair hypotheses act as a deterministic RANSAC pass; the perpendicular
+    # tolerance allows scan variation without joining nearby rows.
+    tolerance = ALIGNED_DOT_TOLERANCE
+    max_gap = ALIGNED_DOT_MAX_GAP
+    min_span = ALIGNED_DOT_MIN_SPAN
+    group_candidates = {}
+
+    def add_chunk(chunk):
+        if len(chunk) < ALIGNED_DOT_MIN_COUNT:
+            return
+        span = chunk[-1][0] - chunk[0][0]
+        if span < min_span:
+            return
+        indices = tuple(sorted(point_index for _, point_index in chunk))
+        group_candidates[indices] = max(group_candidates.get(indices, 0.0), span)
+
+    for first, second in itertools.combinations(range(len(points)), 2):
+        first_point = points[first]
+        second_point = points[second]
+        delta_x = second_point["x"] - first_point["x"]
+        delta_y = second_point["y"] - first_point["y"]
+        seed_distance = float(np.hypot(delta_x, delta_y))
+        if seed_distance < 24.0:
+            continue
+
+        unit_x = delta_x / seed_distance
+        unit_y = delta_y / seed_distance
+        normal_x = -unit_y
+        normal_y = unit_x
+        inliers = []
+        for point_index, point in enumerate(points):
+            offset_x = point["x"] - first_point["x"]
+            offset_y = point["y"] - first_point["y"]
+            perpendicular_distance = abs(offset_x * normal_x + offset_y * normal_y)
+            if perpendicular_distance <= tolerance:
+                projection = offset_x * unit_x + offset_y * unit_y
+                inliers.append((projection, point_index))
+
+        inliers.sort()
+        chunk = []
+        for item in inliers:
+            if chunk and item[0] - chunk[-1][0] > max_gap:
+                add_chunk(chunk)
+                chunk = []
+            chunk.append(item)
+        add_chunk(chunk)
+
+    ordered_groups = sorted(
+        group_candidates.items(), key=lambda item: (-len(item[0]), -item[1])
+    )
+    accepted_groups = []
+    for indices, _ in ordered_groups:
+        index_set = set(indices)
+        if any(
+            len(index_set & set(accepted)) / min(len(indices), len(accepted)) >= 0.8
+            for accepted in accepted_groups
+        ):
+            continue
+        accepted_groups.append(indices)
+
+    selected_indices = sorted(
+        {index for group in accepted_groups for index in group},
+        key=lambda index: (points[index]["y"], points[index]["x"]),
+    )
+    return [points[index] for index in selected_indices]
+
+
+def detect_aligned_dots(tile, gray):
+    """Return compact dark marks belonging to a near-straight row of 5+ dots."""
+    return [
+        (point["x"], point["y"], point["radius"])
+        for point in group_aligned_dot_candidates(detect_dot_candidates(tile, gray))
+    ]
+
+
+def detect_all(tile, x0,y0, dot_candidates_out=None):
     # Ignore colored blue/cyan marks, but retain dark neutral ink on cyan paper.
     blue_mask = blue_cyan_mask(tile)
     tile_for_detection = tile.copy()
@@ -561,7 +759,30 @@ def detect_all(tile, x0,y0):
                 y2,
             )
         )
-    for center_x, center_y, radius in detect_small_circles(gray, th):
+    dot_candidates = detect_dot_candidates(tile, gray)
+    if dot_candidates_out is None:
+        aligned_dots = [
+            (point["x"], point["y"], point["radius"])
+            for point in group_aligned_dot_candidates(dot_candidates)
+        ]
+    else:
+        aligned_dots = []
+        dot_candidates_out.extend(
+            {
+                **candidate,
+                "x": candidate["x"] + x0,
+                "y": candidate["y"] + y0,
+            }
+            for candidate in dot_candidates
+        )
+    small_circles = detect_small_circles(gray, th)
+    for center_x, center_y, radius in small_circles:
+        if any(
+            np.hypot(center_x - dot_x, center_y - dot_y)
+            <= max(7.0, (radius + dot_radius) / 2.0)
+            for dot_x, dot_y, dot_radius in aligned_dots
+        ):
+            continue
         global_x, global_y = center_x + x0, center_y + y0
         out.append(
             (
@@ -572,6 +793,25 @@ def detect_all(tile, x0,y0):
                 2 * np.pi * radius,
                 0.0,
                 "small_circle",
+                center_x,
+                center_y,
+                center_x,
+                center_y,
+                radius,
+            )
+        )
+
+    for center_x, center_y, radius in aligned_dots:
+        global_x, global_y = center_x + x0, center_y + y0
+        out.append(
+            (
+                global_x,
+                global_y,
+                global_x,
+                global_y,
+                2 * np.pi * radius,
+                0.0,
+                "aligned_dot",
                 center_x,
                 center_y,
                 center_x,
@@ -600,6 +840,7 @@ def main():
         "curved": (0, 255, 0),
         "dashed_curve": (255, 0, 255),
         "small_circle": (0, 255, 255),
+        "aligned_dot": (255, 255, 255),
     }
     for tile,x0,y0,tid in tiles:
         cand=detect_all(tile,x0,y0)
@@ -607,7 +848,7 @@ def main():
         for candidate in cand:
             x1,y1,x2,y2,length,ang,typ,lx1,ly1,lx2,ly2 = candidate[:11]
             radius = candidate[11] if len(candidate) > 11 else None
-            if typ == "small_circle":
+            if typ in {"small_circle", "aligned_dot"}:
                 key=(typ,round(x1/2),round(y1/2),round(radius/2))
             else:
                 key=(round(x1/2),round(y1/2),round(x2/2),round(y2/2),typ)
@@ -615,14 +856,24 @@ def main():
             seen.add(key)
             filtered.append({"x1":int(x1),"y1":int(y1),"x2":int(x2),"y2":int(y2),"length":round(length,1),"angle":round(ang,1),"type":typ,"tile":tid,"radius":None if radius is None else round(float(radius),1)})
         all_lines.extend(filtered)
-        counts = {kind: sum(line["type"] == kind for line in filtered) for kind in ("straight", "curved", "dashed_curve", "small_circle")}
-        print(f"  {tid}: straight {counts['straight']} curved {counts['curved']} dashed_curve {counts['dashed_curve']} small_circle {counts['small_circle']}")
+        counts = {
+            kind: sum(line["type"] == kind for line in filtered)
+            for kind in ("straight", "curved", "dashed_curve", "small_circle", "aligned_dot")
+        }
+        print(
+            f"  {tid}: straight {counts['straight']} curved {counts['curved']} "
+            f"dashed_curve {counts['dashed_curve']} small_circle {counts['small_circle']} "
+            f"aligned_dot {counts['aligned_dot']}"
+        )
         dbg=tile.copy()
         for f in filtered:
             lx1,ly1=f["x1"]-x0, f["y1"]-y0; lx2,ly2=f["x2"]-x0, f["y2"]-y0
             col = colors.get(f["type"], (0, 0, 255))
-            if f["type"] == "small_circle":
-                cv2.circle(dbg,(int(lx1),int(ly1)),max(1,int(round(f["radius"]))),col,2,cv2.LINE_AA)
+            if f["type"] in {"small_circle", "aligned_dot"}:
+                radius = max(1, int(round(f["radius"])))
+                if f["type"] == "aligned_dot":
+                    cv2.circle(dbg, (int(lx1), int(ly1)), radius, (0, 0, 0), 4, cv2.LINE_AA)
+                cv2.circle(dbg, (int(lx1), int(ly1)), radius, col, 2, cv2.LINE_AA)
             else:
                 cv2.line(dbg,(int(lx1),int(ly1)),(int(lx2),int(ly2)),col,2)
         cv2.imwrite(os.path.join(args.debug_dir, f"debug_{tid}.jpg"), dbg)

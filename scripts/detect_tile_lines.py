@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import re
 from collections import Counter
 from dataclasses import dataclass
@@ -22,13 +23,21 @@ except ImportError as exc:  # pragma: no cover - depends on the user's environme
 
 try:
     # Running the file as a script puts its directory on sys.path.
-    from detect_lines import detect_all
+    from detect_lines import (
+        ALIGNED_DOT_MAX_GAP,
+        detect_all,
+        group_aligned_dot_candidates,
+    )
 except ModuleNotFoundError as exc:  # pragma: no cover - script vs package import
     if exc.name != "detect_lines":
         raise
     try:
         # Package imports (for example, from tests) need a relative import.
-        from .detect_lines import detect_all
+        from .detect_lines import (
+            ALIGNED_DOT_MAX_GAP,
+            detect_all,
+            group_aligned_dot_candidates,
+        )
     except ImportError as relative_exc:  # pragma: no cover - depends on invocation
         raise SystemExit(
             "Не удалось загрузить scripts/detect_lines.py. "
@@ -52,6 +61,7 @@ LINE_COLORS = {
     "curved": (0, 255, 0),        # green
     "dashed_curve": (255, 0, 255),  # magenta
     "small_circle": (0, 255, 255),  # yellow
+    "aligned_dot": (255, 255, 255),  # white, outlined in black
 }
 
 
@@ -144,7 +154,7 @@ def validate_tiles(tiles: list[Tile], width: int, height: int, tile_size: int) -
 
 def canonical_line_key(line: dict[str, Any]) -> tuple[Any, ...]:
     """Deduplicate near-identical segments or circle centers and radii."""
-    if line["type"] == "small_circle":
+    if line["type"] in {"small_circle", "aligned_dot"}:
         return (
             line["type"],
             round(line["x1"] / 2),
@@ -157,10 +167,56 @@ def canonical_line_key(line: dict[str, Any]) -> tuple[Any, ...]:
     return (line["type"], *endpoints)
 
 
+def group_dot_candidates_in_windows(
+    candidates: list[dict[str, float]], tile_size: int
+) -> list[dict[str, float]]:
+    """Group points in overlapping global windows so rows can cross tile seams."""
+    if not candidates:
+        return []
+
+    stride = tile_size
+    window_size = max(2 * tile_size, tile_size + 4 * ALIGNED_DOT_MAX_GAP + 1)
+    windows: dict[tuple[int, int], list[dict[str, float]]] = {}
+    windows_back = max(0, math.ceil(window_size / stride) - 1)
+
+    for candidate in candidates:
+        x_cell = int(candidate["x"] // stride) * stride
+        y_cell = int(candidate["y"] // stride) * stride
+        for x_step in range(windows_back + 1):
+            x_start = x_cell - x_step * stride
+            if x_start < 0 or not x_start <= candidate["x"] < x_start + window_size:
+                continue
+            for y_step in range(windows_back + 1):
+                y_start = y_cell - y_step * stride
+                if y_start < 0 or not y_start <= candidate["y"] < y_start + window_size:
+                    continue
+                windows.setdefault((x_start, y_start), []).append(candidate)
+
+    aligned_dots = []
+    for window_candidates in windows.values():
+        for dot in group_aligned_dot_candidates(window_candidates):
+            duplicate = next(
+                (
+                    existing
+                    for existing in aligned_dots
+                    if math.hypot(existing["x"] - dot["x"], existing["y"] - dot["y"])
+                    < 4.0
+                ),
+                None,
+            )
+            if duplicate is None:
+                aligned_dots.append(dot.copy())
+            elif dot["radius"] > duplicate["radius"]:
+                duplicate["radius"] = dot["radius"]
+
+    return sorted(aligned_dots, key=lambda dot: (dot["y"], dot["x"]))
+
+
 def detect_tiles(
-    tiles: list[Tile], width: int, height: int
+    tiles: list[Tile], width: int, height: int, tile_size: int = DEFAULT_TILE_SIZE
 ) -> list[dict[str, Any]]:
     all_lines: list[dict[str, Any]] = []
+    all_dot_candidates: list[dict[str, float]] = []
     seen: set[tuple[Any, ...]] = set()
 
     for index, tile_info in enumerate(tiles, start=1):
@@ -177,12 +233,21 @@ def detect_tiles(
             )
 
         try:
-            candidates = detect_all(tile_image, tile_info.x0, tile_info.y0)
+            candidates = detect_all(
+                tile_image,
+                tile_info.x0,
+                tile_info.y0,
+                dot_candidates_out=all_dot_candidates,
+            )
         except cv2.error as exc:
             raise RuntimeError(f"ошибка детектора на тайле {tile_info.path.name}: {exc}") from exc
 
         for candidate in candidates:
             x1, y1, x2, y2, length, angle, line_type = candidate[:7]
+            if line_type == "aligned_dot":
+                # Aligned dots are regrouped globally after all 500 px tiles
+                # have contributed their compact-point candidates.
+                continue
             radius = float(candidate[11]) if len(candidate) > 11 else None
             record = {
                 "x1": max(0, min(width - 1, int(round(x1)))),
@@ -204,6 +269,50 @@ def detect_tiles(
         if index % 25 == 0 or index == len(tiles):
             print(f"Обработано тайлов: {index}/{len(tiles)}")
 
+    aligned_dots = group_dot_candidates_in_windows(all_dot_candidates, tile_size)
+    if aligned_dots:
+        all_lines = [
+            line
+            for line in all_lines
+            if not (
+                line["type"] == "small_circle"
+                and any(
+                    math.hypot(line["x1"] - dot["x"], line["y1"] - dot["y"])
+                    <= max(7.0, (line["radius"] + dot["radius"]) / 2.0)
+                    for dot in aligned_dots
+                )
+            )
+        ]
+        seen = {canonical_line_key(line) for line in all_lines}
+
+        for dot in aligned_dots:
+            x = max(0, min(width - 1, int(round(dot["x"]))))
+            y = max(0, min(height - 1, int(round(dot["y"]))))
+            tile_name = next(
+                (
+                    tile.path.name
+                    for tile in tiles
+                    if tile.x0 <= x <= tile.x1 and tile.y0 <= y <= tile.y1
+                ),
+                tiles[0].path.name,
+            )
+            radius = float(dot["radius"])
+            record = {
+                "x1": x,
+                "y1": y,
+                "x2": x,
+                "y2": y,
+                "length": round(2 * math.pi * radius, 1),
+                "angle": 0.0,
+                "type": "aligned_dot",
+                "tile": tile_name,
+                "radius": round(radius, 1),
+            }
+            key = canonical_line_key(record)
+            if key not in seen:
+                seen.add(key)
+                all_lines.append(record)
+
     all_lines.sort(key=lambda line: (-line["length"], line["y1"], line["x1"]))
     for line_id, record in enumerate(all_lines, start=1):
         record["id"] = line_id
@@ -223,7 +332,7 @@ def draw_overlay(
         color = LINE_COLORS.get(line["type"], (0, 0, 255))
         start = (line["x1"], line["y1"])
         end = (line["x2"], line["y2"])
-        if line["type"] == "small_circle":
+        if line["type"] in {"small_circle", "aligned_dot"}:
             radius = max(1, int(round(line["radius"])))
             cv2.circle(overlay, start, radius, (0, 0, 0), 4, cv2.LINE_AA)
             cv2.circle(overlay, start, radius, color, 2, cv2.LINE_AA)
@@ -247,7 +356,7 @@ def draw_overlay(
             color = LINE_COLORS.get(line["type"], (0, 0, 255))
             start = (round(line["x1"] * scale), round(line["y1"] * scale))
             end = (round(line["x2"] * scale), round(line["y2"] * scale))
-            if line["type"] == "small_circle":
+            if line["type"] in {"small_circle", "aligned_dot"}:
                 radius = max(1, round(line["radius"] * scale))
                 cv2.circle(preview, start, radius, (0, 0, 0), 4, cv2.LINE_AA)
                 cv2.circle(preview, start, radius, color, 2, cv2.LINE_AA)
@@ -330,7 +439,7 @@ def run(
     print(f"Тайлы: {tiles_dir} ({len(tiles)} шт.)")
     print("Запускаю тот же детектор, что используется в scripts/detect_lines.py")
 
-    lines = detect_tiles(tiles, width, height)
+    lines = detect_tiles(tiles, width, height, tile_size)
     output_dir.mkdir(parents=True, exist_ok=True)
     json_path, csv_path = write_line_files(
         output_dir, image_path, tiles_dir, width, height, len(tiles), lines
@@ -346,7 +455,10 @@ def run(
     print(f"CSV: {csv_path}")
     print(f"Полноразмерное наложение: {overlay_path}")
     print(f"Превью: {preview_path}")
-    print("Цвета: straight — красный, curved — зелёный, dashed_curve — пурпурный, small_circle — жёлтый.")
+    print(
+        "Цвета: straight — красный, curved — зелёный, dashed_curve — пурпурный, "
+        "small_circle — жёлтый, aligned_dot — белый с чёрной каймой."
+    )
 
 
 def main() -> int:
