@@ -33,6 +33,14 @@ class AlignedDotDetectionTests(unittest.TestCase):
             {"x": float(x), "y": 180.0, "radius": 5.0, "area": 30}
             for x in (30, 70, 130, 180, 250, 300)
         ]
+        too_close_points = [
+            {"x": float(x), "y": 220.0, "radius": 5.0, "area": 30}
+            for x in (30, 55, 80, 105, 130, 155)
+        ]
+        minimum_spacing_points = [
+            {"x": float(x), "y": 260.0, "radius": 5.0, "area": 30}
+            for x in (30, 70, 110, 150, 190, 230)
+        ]
         widely_spaced_points = [
             {"x": x, "y": y, "radius": 5.0, "area": 30}
             for x, y in (
@@ -46,7 +54,9 @@ class AlignedDotDetectionTests(unittest.TestCase):
         ]
 
         self.assertEqual(len(group_aligned_dot_candidates(regular_points)), 6)
+        self.assertEqual(len(group_aligned_dot_candidates(minimum_spacing_points)), 6)
         self.assertEqual(len(group_aligned_dot_candidates(widely_spaced_points)), 6)
+        self.assertEqual(group_aligned_dot_candidates(too_close_points), [])
         self.assertEqual(group_aligned_dot_candidates(irregular_points), [])
         self.assertEqual(
             filter_dot_candidates_near_lines(regular_points, [(0, 100, 350, 100)]), []

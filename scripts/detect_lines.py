@@ -17,7 +17,7 @@ ALIGNED_DOT_SPACING_MAX_CV = 0.15
 ALIGNED_DOT_LATTICE_PHASE_TOLERANCE = 5.5
 ALIGNED_DOT_LATTICE_PHASE_REL_TOLERANCE = 0.25
 ALIGNED_DOT_MAX_LATTICE_RESIDUAL_RATIO = 0.32
-ALIGNED_DOT_MIN_SPACING = 20.0
+ALIGNED_DOT_MIN_SPACING = 40.0
 DOT_CANDIDATE_MERGE_DISTANCE = 9.0
 
 
@@ -1054,7 +1054,7 @@ def group_aligned_dot_candidates(candidates):
     for first, second in pair_hypotheses:
         delta = coordinates[second] - coordinates[first]
         seed_distance = float(np.hypot(delta[0], delta[1]))
-        if seed_distance < 24.0:
+        if seed_distance < ALIGNED_DOT_MIN_SPACING:
             continue
         seed_axis = delta / seed_distance
         if shared_axes:
