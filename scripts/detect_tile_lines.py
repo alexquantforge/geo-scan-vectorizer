@@ -25,6 +25,8 @@ try:
     # Running the file as a script puts its directory on sys.path.
     from detect_lines import (
         ALIGNED_DOT_MAX_GAP,
+        ALIGNED_DOT_MIN_LINE_CLEARANCE,
+        DOT_LINE_FILTER_MIN_SEGMENT_LENGTH,
         detect_all,
         filter_dot_candidates_near_lines,
         group_aligned_dot_candidates,
@@ -36,6 +38,8 @@ except ModuleNotFoundError as exc:  # pragma: no cover - script vs package impor
         # Package imports (for example, from tests) need a relative import.
         from .detect_lines import (
             ALIGNED_DOT_MAX_GAP,
+            ALIGNED_DOT_MIN_LINE_CLEARANCE,
+            DOT_LINE_FILTER_MIN_SEGMENT_LENGTH,
             detect_all,
             filter_dot_candidates_near_lines,
             group_aligned_dot_candidates,
@@ -318,7 +322,7 @@ def detect_tiles(
         (line["x1"], line["y1"], line["x2"], line["y2"])
         for line in all_lines
         if line["type"] in {"straight", "curved", "dashed_curve"}
-        and line["length"] >= 35.0
+        and line["length"] >= DOT_LINE_FILTER_MIN_SEGMENT_LENGTH
     ]
     in_bounds_dot_candidates = [
         candidate
@@ -328,7 +332,8 @@ def detect_tiles(
     print(
         f"Проверка точек по существующим линиям: "
         f"кандидатов={len(in_bounds_dot_candidates)}, "
-        f"линейных сегментов={len(existing_line_segments)}.",
+        f"линейных сегментов={len(existing_line_segments)}, "
+        f"минимальный отступ={ALIGNED_DOT_MIN_LINE_CLEARANCE:g} px.",
         flush=True,
     )
 

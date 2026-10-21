@@ -19,6 +19,8 @@ ALIGNED_DOT_LATTICE_PHASE_REL_TOLERANCE = 0.25
 ALIGNED_DOT_MAX_LATTICE_RESIDUAL_RATIO = 0.32
 ALIGNED_DOT_MIN_SPACING = 40.0
 DOT_CANDIDATE_MERGE_DISTANCE = 9.0
+ALIGNED_DOT_MIN_LINE_CLEARANCE = 20.0
+DOT_LINE_FILTER_MIN_SEGMENT_LENGTH = 20.0
 
 
 def split_into_tiles(img, cols, rows, overlap):
@@ -599,13 +601,14 @@ def filter_dot_candidates_near_lines(
     progress_callback=None,
     index_progress_callback=None,
 ):
-    """Discard point centers that overlap a detected segment using a spatial index."""
+    """Discard point centers too close to detected segments via spatial indexing."""
     if not candidates or not line_segments:
         return candidates
 
     cell_size = 128.0
     maximum_threshold = max(
-        3.0, max(candidate["radius"] * 0.5 for candidate in candidates)
+        ALIGNED_DOT_MIN_LINE_CLEARANCE,
+        max(candidate["radius"] * 1.5 for candidate in candidates),
     )
     segment_cells = {}
     prepared_segments = []
@@ -634,7 +637,9 @@ def filter_dot_candidates_near_lines(
     filtered = []
     report_interval = max(1, len(candidates) // 10)
     for candidate_index, candidate in enumerate(candidates, start=1):
-        threshold = max(3.0, candidate["radius"] * 0.5)
+        threshold = max(
+            ALIGNED_DOT_MIN_LINE_CLEARANCE, candidate["radius"] * 1.5
+        )
         cell = (
             int(candidate["x"] // cell_size),
             int(candidate["y"] // cell_size),
@@ -1198,7 +1203,7 @@ def detect_all(tile, x0,y0, dot_candidates_out=None):
         tuple(float(value) for value in candidate[7:11])
         for candidate in out
         if candidate[6] in {"straight", "curved", "dashed_curve"}
-        and candidate[4] >= 35.0
+        and candidate[4] >= DOT_LINE_FILTER_MIN_SEGMENT_LENGTH
     ]
     dot_candidates = filter_dot_candidates_near_lines(
         detect_dot_candidates(tile, gray), line_segments
