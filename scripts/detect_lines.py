@@ -250,10 +250,10 @@ def detect_dashed_curve_segments(gray, binary):
 def detect_small_circles(gray, binary):
     """Find small, closed ring symbols while rejecting isolated texture specks.
 
-    A candidate must have a nearly circular outer contour, a centered circular
-    hole with a light interior, and dark-pixel support around its annulus. The
-    bright-core test rejects filled dots; non-maximum suppression removes nested
-    contour duplicates.
+    Prefer a circular outer contour around a centered, light hole. A fallback
+    also accepts a small light hole when an attached stroke distorts the outer
+    contour, but only if a dark annulus is strongly supported around it. Bright
+    core checks reject filled dots; non-maximum suppression removes duplicates.
     """
     closed = cv2.morphologyEx(
         binary,
@@ -268,6 +268,52 @@ def detect_small_circles(gray, binary):
 
     hierarchy = hierarchy[0]
     candidates = []
+
+    def ring_evidence(
+        center_x,
+        center_y,
+        radius,
+        inner_x,
+        inner_y,
+        inner_radius,
+        sample_count=48,
+        patch_radius=2,
+    ):
+        core_radius = max(1.0, inner_radius * 0.55)
+        core_x0 = max(0, int(np.floor(inner_x - core_radius)))
+        core_x1 = min(gray.shape[1], int(np.ceil(inner_x + core_radius)) + 1)
+        core_y0 = max(0, int(np.floor(inner_y - core_radius)))
+        core_y1 = min(gray.shape[0], int(np.ceil(inner_y + core_radius)) + 1)
+        core_patch = gray[core_y0:core_y1, core_x0:core_x1]
+        core_y, core_x = np.ogrid[core_y0:core_y1, core_x0:core_x1]
+        core_mask = (core_x - inner_x) ** 2 + (core_y - inner_y) ** 2 <= core_radius ** 2
+        core_pixels = core_patch[core_mask]
+        if core_pixels.size < 3:
+            return None
+        core_brightness = float(np.median(core_pixels))
+
+        supported_angles = 0
+        dark_ring_pixels = []
+        for angle in np.linspace(0, 2 * np.pi, sample_count, endpoint=False):
+            sample_x = int(round(center_x + radius * np.cos(angle)))
+            sample_y = int(round(center_y + radius * np.sin(angle)))
+            y_start = max(0, sample_y - patch_radius)
+            y_end = min(gray.shape[0], sample_y + patch_radius + 1)
+            x_start = max(0, sample_x - patch_radius)
+            x_end = min(gray.shape[1], sample_x + patch_radius + 1)
+            patch = gray[y_start:y_end, x_start:x_end]
+            if patch.size:
+                dark_pixels = patch[patch <= 110]
+                if dark_pixels.size:
+                    supported_angles += 1
+                    dark_ring_pixels.extend(dark_pixels.tolist())
+
+        if not dark_ring_pixels:
+            return None
+        dark_support = supported_angles / sample_count
+        ring_brightness = float(np.median(dark_ring_pixels))
+        return core_brightness, dark_support, ring_brightness
+
     for index, contour in enumerate(contours):
         child_index = int(hierarchy[index][2])
         if child_index < 0:
@@ -332,41 +378,20 @@ def detect_small_circles(gray, binary):
         center_y = (outer_y + inner_y) / 2.0
         radius = (outer_radius + inner_radius) / 2.0 + 1.0
 
-        # Verify that the hole is genuinely light, not just a thresholding gap
-        # inside a dark blob. Sample its central disk, away from the ink edge.
-        core_radius = max(1.0, inner_radius * 0.55)
-        core_x0 = max(0, int(np.floor(inner_x - core_radius)))
-        core_x1 = min(gray.shape[1], int(np.ceil(inner_x + core_radius)) + 1)
-        core_y0 = max(0, int(np.floor(inner_y - core_radius)))
-        core_y1 = min(gray.shape[0], int(np.ceil(inner_y + core_radius)) + 1)
-        core_patch = gray[core_y0:core_y1, core_x0:core_x1]
-        core_y, core_x = np.ogrid[core_y0:core_y1, core_x0:core_x1]
-        core_mask = (core_x - inner_x) ** 2 + (core_y - inner_y) ** 2 <= core_radius ** 2
-        core_pixels = core_patch[core_mask]
-        if core_pixels.size < 3:
+        # The interior must be genuinely light, with a dark annulus around it.
+        evidence = ring_evidence(
+            center_x,
+            center_y,
+            radius - 0.8,
+            inner_x,
+            inner_y,
+            inner_radius,
+        )
+        if evidence is None:
             continue
-        core_brightness = float(np.median(core_pixels))
-
-        support_radius = radius - 0.8
-        supported_angles = 0
-        dark_ring_pixels = []
-        sample_count = 48
-        for angle in np.linspace(0, 2 * np.pi, sample_count, endpoint=False):
-            sample_x = int(round(center_x + support_radius * np.cos(angle)))
-            sample_y = int(round(center_y + support_radius * np.sin(angle)))
-            y_start, y_end = max(0, sample_y - 2), min(gray.shape[0], sample_y + 3)
-            x_start, x_end = max(0, sample_x - 2), min(gray.shape[1], sample_x + 3)
-            patch = gray[y_start:y_end, x_start:x_end]
-            if patch.size:
-                dark_pixels = patch[patch <= 110]
-                if dark_pixels.size:
-                    supported_angles += 1
-                    dark_ring_pixels.extend(dark_pixels.tolist())
-
-        dark_support = supported_angles / sample_count
-        if dark_support < 0.5 or not dark_ring_pixels:
+        core_brightness, dark_support, ring_brightness = evidence
+        if dark_support < 0.5:
             continue
-        ring_brightness = float(np.median(dark_ring_pixels))
         if core_brightness < 130 or core_brightness - ring_brightness < 30:
             continue
 
@@ -379,6 +404,94 @@ def detect_small_circles(gray, binary):
         )
         candidates.append((score, center_x, center_y, radius))
 
+    # A circle may touch a nearby stroke, making the outer contour elongated.
+    # In that case use its small, bright hole as the center proposal and verify
+    # a dark annulus locally instead of requiring the whole component to be round.
+    for hole_index, hole in enumerate(contours):
+        parent_index = int(hierarchy[hole_index][3])
+        if parent_index < 0:
+            continue
+
+        ancestor_count = 0
+        ancestor_index = parent_index
+        while ancestor_index >= 0:
+            ancestor_count += 1
+            ancestor_index = int(hierarchy[ancestor_index][3])
+        if ancestor_count % 2 == 0:
+            continue
+
+        hole_area = float(cv2.contourArea(hole))
+        hole_perimeter = float(cv2.arcLength(hole, True))
+        if hole_area <= 0 or hole_perimeter <= 0:
+            continue
+        hole_circularity = 4 * np.pi * hole_area / (hole_perimeter ** 2)
+        _, _, hole_width, hole_height = cv2.boundingRect(hole)
+        hole_aspect = max(hole_width, hole_height) / max(1, min(hole_width, hole_height))
+        (inner_x, inner_y), inner_radius = cv2.minEnclosingCircle(hole)
+        if not (
+            2.5 <= inner_radius <= 8.5
+            and hole_aspect <= 1.5
+            and hole_circularity >= 0.5
+        ):
+            continue
+
+        parent = contours[parent_index]
+        parent_area = float(cv2.contourArea(parent))
+        parent_perimeter = float(cv2.arcLength(parent, True))
+        _, _, parent_width, parent_height = cv2.boundingRect(parent)
+        parent_aspect = max(parent_width, parent_height) / max(
+            1, min(parent_width, parent_height)
+        )
+        _, parent_radius = cv2.minEnclosingCircle(parent)
+        parent_circularity = (
+            4 * np.pi * parent_area / (parent_perimeter ** 2)
+            if parent_perimeter > 0
+            else 0.0
+        )
+        if max(parent_width, parent_height) > 40 or parent_area > 700:
+            continue
+        if (
+            5.5 <= parent_radius <= 20.0
+            and parent_aspect <= 1.4
+            and parent_circularity >= 0.5
+        ):
+            continue  # The primary outer-contour pass already handles this ring.
+
+        best_fallback = None
+        min_radius = max(inner_radius + 0.8, 3.5)
+        max_radius = min(18.0, inner_radius * 2.4)
+        preferred_radius = inner_radius + 2.0
+        for ring_radius in np.arange(min_radius, max_radius + 0.01, 0.5):
+            evidence = ring_evidence(
+                inner_x,
+                inner_y,
+                ring_radius,
+                inner_x,
+                inner_y,
+                inner_radius,
+                sample_count=72,
+                patch_radius=1,
+            )
+            if evidence is None:
+                continue
+            core_brightness, dark_support, ring_brightness = evidence
+            if dark_support < 0.65:
+                continue
+            if core_brightness < 130 or core_brightness - ring_brightness < 30:
+                continue
+            rank = (
+                dark_support,
+                -ring_brightness,
+                -abs(ring_radius - preferred_radius),
+            )
+            if best_fallback is None or rank > best_fallback[0]:
+                best_fallback = (rank, ring_radius, dark_support)
+
+        if best_fallback is not None:
+            _, ring_radius, dark_support = best_fallback
+            score = dark_support - 0.01 * abs(ring_radius - preferred_radius)
+            candidates.append((1.0 + score, inner_x, inner_y, ring_radius))
+
     candidates.sort(key=lambda candidate: candidate[0], reverse=True)
     circles = []
     for _, center_x, center_y, radius in candidates:
@@ -388,7 +501,7 @@ def detect_small_circles(gray, binary):
             for other_x, other_y, other_radius in circles
         ):
             continue
-        circles.append((center_x, center_y, radius))
+        circles.append((float(center_x), float(center_y), float(radius)))
     return circles
 
 

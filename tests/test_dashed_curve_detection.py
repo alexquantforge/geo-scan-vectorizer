@@ -143,6 +143,17 @@ class SmallCircleDetectionTests(unittest.TestCase):
         self.assertEqual(len(circles), 1)
         self.assertLess(np.hypot(circles[0][0] - 40, circles[0][1] - 40), 1)
 
+    def test_detects_a_ring_touching_a_short_stroke(self) -> None:
+        image = np.full((250, 250, 3), 220, dtype=np.uint8)
+        cv2.circle(image, (100, 100), 6, (10, 10, 10), 2, cv2.LINE_AA)
+        cv2.line(image, (105, 100), (115, 100), (10, 10, 10), 2, cv2.LINE_AA)
+
+        detections = detect_all(image, 0, 0)
+        circles = [item for item in detections if item[6] == "small_circle"]
+        self.assertEqual(len(circles), 1)
+        self.assertLess(np.hypot(circles[0][0] - 100, circles[0][1] - 100), 2)
+        self.assertLessEqual(circles[0][11], 7)
+
 
 if __name__ == "__main__":
     unittest.main()
