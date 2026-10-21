@@ -25,6 +25,9 @@ try:
     # Running the file as a script puts its directory on sys.path.
     from detect_lines import (
         ALIGNED_DOT_MAX_GAP,
+        ALIGNED_DOT_MAX_GAP_MULTIPLE,
+        ALIGNED_DOT_MIN_COUNT,
+        ALIGNED_DOT_SPACING_REL_TOLERANCE,
         detect_all,
         filter_dot_candidates_near_lines,
         group_aligned_dot_candidates,
@@ -36,6 +39,9 @@ except ModuleNotFoundError as exc:  # pragma: no cover - script vs package impor
         # Package imports (for example, from tests) need a relative import.
         from .detect_lines import (
             ALIGNED_DOT_MAX_GAP,
+            ALIGNED_DOT_MAX_GAP_MULTIPLE,
+            ALIGNED_DOT_MIN_COUNT,
+            ALIGNED_DOT_SPACING_REL_TOLERANCE,
             detect_all,
             filter_dot_candidates_near_lines,
             group_aligned_dot_candidates,
@@ -177,7 +183,13 @@ def group_dot_candidates_in_windows(
         return []
 
     stride = tile_size
-    window_size = max(2 * tile_size, tile_size + 4 * ALIGNED_DOT_MAX_GAP + 1)
+    maximum_observed_gap = (
+        ALIGNED_DOT_MAX_GAP
+        * ALIGNED_DOT_MAX_GAP_MULTIPLE
+        * (1.0 + ALIGNED_DOT_SPACING_REL_TOLERANCE)
+    )
+    minimum_row_span = (ALIGNED_DOT_MIN_COUNT - 1) * maximum_observed_gap
+    window_size = max(2 * tile_size, int(math.ceil(minimum_row_span)) + 1)
     windows: dict[tuple[int, int], list[dict[str, float]]] = {}
     windows_back = max(0, math.ceil(window_size / stride) - 1)
 
@@ -277,8 +289,13 @@ def detect_tiles(
         if line["type"] in {"straight", "curved", "dashed_curve"}
         and line["length"] >= 35.0
     ]
+    in_bounds_dot_candidates = [
+        candidate
+        for candidate in all_dot_candidates
+        if 0.0 <= candidate["x"] < width and 0.0 <= candidate["y"] < height
+    ]
     candidates_off_lines = filter_dot_candidates_near_lines(
-        all_dot_candidates, existing_line_segments
+        in_bounds_dot_candidates, existing_line_segments
     )
     aligned_dots = group_dot_candidates_in_windows(candidates_off_lines, tile_size)
     if aligned_dots:

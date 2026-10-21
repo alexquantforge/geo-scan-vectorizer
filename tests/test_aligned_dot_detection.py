@@ -43,6 +43,102 @@ class AlignedDotDetectionTests(unittest.TestCase):
             filter_dot_candidates_near_lines(regular_points, [(0, 100, 350, 100)]), []
         )
 
+    def test_parallel_rows_allow_skipped_marks_but_keep_six_point_minimum(self) -> None:
+        direction = np.array([0.4, 0.916515], dtype=np.float64)
+        direction /= np.linalg.norm(direction)
+
+        def make_row(origin: tuple[float, float], spacing: float, slots: list[int]):
+            candidates = []
+            for index, slot in enumerate(slots):
+                center = np.asarray(origin) + direction * spacing * slot
+                jitter = np.array([(-1) ** index * 0.8, (index % 3 - 1) * 0.6])
+                candidates.append(
+                    {
+                        "x": float(center[0] + jitter[0]),
+                        "y": float(center[1] + jitter[1]),
+                        "radius": 5.0,
+                        "area": 30,
+                    }
+                )
+            return candidates
+
+        first_row = make_row((250, 100), 60, [0, 1, 4, 5, 6, 9, 10])
+        parallel_row = make_row((140, 148), 70, list(range(8)))
+        five_point_decoy = make_row((400, 10), 55, list(range(5)))
+        candidates = first_row + parallel_row + five_point_decoy
+
+        aligned_dots = group_aligned_dot_candidates(candidates)
+        self.assertEqual(len(aligned_dots), len(first_row) + len(parallel_row))
+        for expected in first_row + parallel_row:
+            self.assertLess(
+                min(
+                    np.hypot(dot["x"] - expected["x"], dot["y"] - expected["y"])
+                    for dot in aligned_dots
+                ),
+                2.0,
+            )
+        self.assertTrue(
+            all(
+                min(
+                    np.hypot(dot["x"] - decoy["x"], dot["y"] - decoy["y"])
+                    for dot in aligned_dots
+                )
+                > 2.0
+                for decoy in five_point_decoy
+            )
+        )
+
+    def test_tiled_pipeline_groups_a_periodic_row_with_two_missing_marks(self) -> None:
+        source_image = np.full((900, 1000, 3), 220, dtype=np.uint8)
+        direction = np.array([0.4, 0.916515], dtype=np.float64)
+        direction /= np.linalg.norm(direction)
+        origin = np.array([320.0, 50.0])
+        global_centers = [
+            tuple(np.rint(origin + direction * 60 * slot).astype(int))
+            for slot in (0, 1, 4, 5, 6, 9, 10)
+        ]
+        for center in global_centers:
+            cv2.circle(source_image, center, 6, (10, 10, 10), 2, cv2.LINE_AA)
+        ring_center = (100, 800)
+        cv2.circle(source_image, ring_center, 8, (10, 10, 10), 2, cv2.LINE_AA)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            tiles = []
+            for y0 in (0, 500):
+                for x0 in (0, 500):
+                    x1 = min(x0 + 500, 1000) - 1
+                    y1 = min(y0 + 500, 900) - 1
+                    tile_path = root / f"{x0:05d}_{y0:05d}_{x1:05d}_{y1:05d}.png"
+                    tile_image = source_image[y0 : y1 + 1, x0 : x1 + 1]
+                    self.assertTrue(cv2.imwrite(str(tile_path), tile_image))
+                    tiles.append(Tile(tile_path, x0, y0, x1, y1))
+
+            records = detect_tiles(tiles, width=1000, height=900)
+            aligned_dots = [
+                record for record in records if record["type"] == "aligned_dot"
+            ]
+            self.assertEqual(len(aligned_dots), len(global_centers))
+            actual_centers = {(record["x1"], record["y1"]) for record in aligned_dots}
+            self.assertEqual(actual_centers, set(global_centers))
+            small_circles = [
+                record for record in records if record["type"] == "small_circle"
+            ]
+            self.assertEqual(len(small_circles), 1)
+            self.assertLess(
+                np.hypot(
+                    small_circles[0]["x1"] - ring_center[0],
+                    small_circles[0]["y1"] - ring_center[1],
+                ),
+                2.0,
+            )
+            self.assertTrue(
+                all(
+                    0 <= record["x1"] < 1000 and 0 <= record["y1"] < 900
+                    for record in aligned_dots
+                )
+            )
+
     def test_tiled_pipeline_requires_six_regular_points(self) -> None:
         tile_image = np.full((500, 500, 3), 220, dtype=np.uint8)
         aligned_centers = [

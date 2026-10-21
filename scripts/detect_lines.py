@@ -5,11 +5,17 @@ import numpy as np
 from pathlib import Path
 
 ALIGNED_DOT_MIN_COUNT = 6
-ALIGNED_DOT_TOLERANCE = 4.0
+ALIGNED_DOT_TOLERANCE = 6.0
 ALIGNED_DOT_MAX_GAP = 170.0
+ALIGNED_DOT_MAX_GAP_MULTIPLE = 3
+ALIGNED_DOT_PARALLEL_BAND_GAP = 16.0
+ALIGNED_DOT_PARALLEL_ANGLE_TOLERANCE = 10.0
 ALIGNED_DOT_MIN_SPAN = 40.0
 ALIGNED_DOT_SPACING_REL_TOLERANCE = 0.22
 ALIGNED_DOT_SPACING_MAX_CV = 0.15
+ALIGNED_DOT_LATTICE_PHASE_TOLERANCE = 5.5
+ALIGNED_DOT_LATTICE_PHASE_REL_TOLERANCE = 0.25
+ALIGNED_DOT_MAX_LATTICE_RESIDUAL_RATIO = 0.32
 ALIGNED_DOT_MIN_SPACING = 20.0
 DOT_CANDIDATE_MERGE_DISTANCE = 9.0
 
@@ -668,85 +674,376 @@ def merge_dot_candidates(candidates):
     return merged
 
 
+def _dominant_dot_axes(points):
+    """Estimate the strongest shared orientations of parallel point rows."""
+    angle_votes = np.zeros(180, dtype=np.float64)
+    valid_pairs = 0
+    for first, second in itertools.combinations(points, 2):
+        delta_x = second["x"] - first["x"]
+        delta_y = second["y"] - first["y"]
+        distance = float(np.hypot(delta_x, delta_y))
+        if not ALIGNED_DOT_MIN_SPACING <= distance <= ALIGNED_DOT_MAX_GAP:
+            continue
+        angle = np.degrees(np.arctan2(delta_y, delta_x)) % 180.0
+        angle_votes[int(round(angle)) % 180] += 1.0
+        valid_pairs += 1
+
+    if valid_pairs < ALIGNED_DOT_MIN_COUNT - 1:
+        return []
+
+    smoothed_votes = np.array(
+        [
+            sum(angle_votes[(index + offset) % 180] for offset in range(-3, 4))
+            for index in range(180)
+        ],
+        dtype=np.float64,
+    )
+    minimum_support = max(4.0, 0.1 * valid_pairs)
+    remaining = smoothed_votes.copy()
+    axes = []
+    while len(axes) < 4:
+        peak = int(np.argmax(remaining))
+        if remaining[peak] < minimum_support:
+            break
+
+        neighborhood = [
+            index
+            for index in range(180)
+            if min((index - peak) % 180, (peak - index) % 180) <= 4
+        ]
+        doubled_angles = np.deg2rad(2.0 * np.asarray(neighborhood, dtype=np.float64))
+        weights = smoothed_votes[neighborhood]
+        mean_angle = 0.5 * np.arctan2(
+            np.sum(weights * np.sin(doubled_angles)),
+            np.sum(weights * np.cos(doubled_angles)),
+        )
+        angle = float(np.degrees(mean_angle) % 180.0)
+        axes.append(
+            np.array([np.cos(np.deg2rad(angle)), np.sin(np.deg2rad(angle))])
+        )
+
+        for index in range(180):
+            if min((index - peak) % 180, (peak - index) % 180) <= 20:
+                remaining[index] = 0.0
+    return axes
+
+
+def _fit_aligned_dot_line(points, seed_indices):
+    """Refit a candidate line and gather its global perpendicular inliers."""
+    coordinates = np.asarray(
+        [[point["x"], point["y"]] for point in points], dtype=np.float64
+    )
+    current = tuple(sorted(set(seed_indices)))
+    seen = set()
+
+    for _ in range(6):
+        if len(current) < ALIGNED_DOT_MIN_COUNT:
+            return None
+        selected = coordinates[list(current)]
+        center = selected.mean(axis=0)
+        _, _, eigenvectors = np.linalg.svd(selected - center, full_matrices=False)
+        normal = eigenvectors[1]
+        distances = np.abs((coordinates - center) @ normal)
+        inliers = tuple(
+            int(index)
+            for index in np.flatnonzero(distances <= ALIGNED_DOT_TOLERANCE)
+        )
+        if len(inliers) < ALIGNED_DOT_MIN_COUNT:
+            return None
+        if inliers == current or inliers in seen:
+            current = inliers if len(inliers) > len(current) else current
+            break
+        seen.add(current)
+        current = inliers
+
+    selected = coordinates[list(current)]
+    center = selected.mean(axis=0)
+    _, _, eigenvectors = np.linalg.svd(selected - center, full_matrices=False)
+    distances = np.abs((coordinates - center) @ eigenvectors[1])
+    inliers = tuple(
+        int(index)
+        for index in np.flatnonzero(distances <= ALIGNED_DOT_TOLERANCE)
+    )
+    if len(inliers) < ALIGNED_DOT_MIN_COUNT:
+        return None
+
+    selected = coordinates[list(inliers)]
+    center = selected.mean(axis=0)
+    _, _, eigenvectors = np.linalg.svd(selected - center, full_matrices=False)
+    axis = eigenvectors[0]
+    if axis[0] < 0 or (axis[0] == 0 and axis[1] < 0):
+        axis = -axis
+    return inliers, center, axis
+
+
+def _parallel_band_models(points, shared_axis):
+    """Seed local line fits by clustering candidates across the shared axis."""
+    normal = np.array([-shared_axis[1], shared_axis[0]])
+    coordinates = np.asarray(
+        [[point["x"], point["y"]] for point in points], dtype=np.float64
+    )
+    offsets = coordinates @ normal
+    order = np.argsort(offsets)
+    bands = []
+    band = [int(order[0])]
+    for previous, current in zip(order, order[1:]):
+        if offsets[current] - offsets[previous] > ALIGNED_DOT_PARALLEL_BAND_GAP:
+            if len(band) >= ALIGNED_DOT_MIN_COUNT:
+                bands.append(tuple(band))
+            band = []
+        band.append(int(current))
+    if len(band) >= ALIGNED_DOT_MIN_COUNT:
+        bands.append(tuple(band))
+
+    models = []
+    for band in bands:
+        model = _fit_aligned_dot_line(points, band)
+        if model is None:
+            continue
+        direction_alignment = abs(float(np.dot(model[2], shared_axis)))
+        angle_difference = float(
+            np.degrees(np.arccos(np.clip(direction_alignment, -1.0, 1.0)))
+        )
+        if angle_difference <= ALIGNED_DOT_PARALLEL_ANGLE_TOLERANCE:
+            models.append(model[0])
+    return models
+
+
+def _regular_aligned_dot_groups(points, line_indices, center, axis):
+    """Find lattice-consistent sequences, allowing up to two missed dots."""
+    ordered = sorted(
+        (
+            float((np.array([points[index]["x"], points[index]["y"]]) - center) @ axis),
+            index,
+        )
+        for index in line_indices
+    )
+    if len(ordered) < ALIGNED_DOT_MIN_COUNT:
+        return {}
+
+    projections = np.asarray([item[0] for item in ordered], dtype=np.float64)
+    point_indices = [item[1] for item in ordered]
+    spacing_seeds = set()
+    for first in range(len(projections) - 1):
+        for second in range(first + 1, len(projections)):
+            distance = projections[second] - projections[first]
+            for multiple in range(1, ALIGNED_DOT_MAX_GAP_MULTIPLE + 1):
+                spacing = distance / multiple
+                if ALIGNED_DOT_MIN_SPACING <= spacing <= ALIGNED_DOT_MAX_GAP:
+                    spacing_seeds.add(round(float(spacing), 1))
+
+    group_candidates = {}
+    for spacing_seed in sorted(spacing_seeds):
+        for anchor in projections:
+            phase = float(anchor)
+            spacing = float(spacing_seed)
+            chosen = []
+            for _ in range(4):
+                slot_candidates = {}
+                phase_tolerance = max(
+                    ALIGNED_DOT_LATTICE_PHASE_TOLERANCE,
+                    spacing * ALIGNED_DOT_LATTICE_PHASE_REL_TOLERANCE,
+                )
+                for projection, point_index in zip(projections, point_indices):
+                    slot = int(round((projection - phase) / spacing))
+                    residual = abs(projection - (phase + slot * spacing))
+                    if residual > phase_tolerance:
+                        continue
+                    rank = (residual, -float(points[point_index].get("area", 0.0)))
+                    previous = slot_candidates.get(slot)
+                    if previous is None or rank < previous[0]:
+                        slot_candidates[slot] = (rank, projection, point_index)
+
+                chosen = sorted(
+                    (slot, float(value[1]), value[2])
+                    for slot, value in slot_candidates.items()
+                )
+                if len(chosen) < ALIGNED_DOT_MIN_COUNT:
+                    break
+
+                slots = np.asarray([item[0] for item in chosen], dtype=np.float64)
+                values = np.asarray([item[1] for item in chosen], dtype=np.float64)
+                design = np.column_stack((np.ones(len(slots)), slots))
+                phase, spacing = np.linalg.lstsq(design, values, rcond=None)[0]
+                if not ALIGNED_DOT_MIN_SPACING <= spacing <= ALIGNED_DOT_MAX_GAP:
+                    break
+
+            if len(chosen) < ALIGNED_DOT_MIN_COUNT:
+                continue
+
+            runs = []
+            run = []
+            for item in chosen:
+                if (
+                    run
+                    and item[0] - run[-1][0] > ALIGNED_DOT_MAX_GAP_MULTIPLE
+                ):
+                    if len(run) >= ALIGNED_DOT_MIN_COUNT:
+                        runs.append(run)
+                    run = []
+                run.append(item)
+            if len(run) >= ALIGNED_DOT_MIN_COUNT:
+                runs.append(run)
+
+            for run in runs:
+                slots = np.asarray([item[0] for item in run], dtype=np.float64)
+                values = np.asarray([item[1] for item in run], dtype=np.float64)
+                design = np.column_stack((np.ones(len(slots)), slots))
+                run_phase, run_spacing = np.linalg.lstsq(
+                    design, values, rcond=None
+                )[0]
+                if not ALIGNED_DOT_MIN_SPACING <= run_spacing <= ALIGNED_DOT_MAX_GAP:
+                    continue
+
+                slot_gaps = np.diff(slots)
+                if np.any(slot_gaps > ALIGNED_DOT_MAX_GAP_MULTIPLE):
+                    continue
+                single_step_gaps = np.diff(values) / slot_gaps
+                median_gap = float(np.median(single_step_gaps))
+                if median_gap < ALIGNED_DOT_MIN_SPACING:
+                    continue
+                relative_deviation = float(
+                    np.max(np.abs(single_step_gaps - median_gap)) / median_gap
+                )
+                spacing_cv = float(np.std(single_step_gaps) / np.mean(single_step_gaps))
+                span = float(values[-1] - values[0])
+                residuals = values - (run_phase + run_spacing * slots)
+                max_residual = float(np.max(np.abs(residuals)))
+                if (
+                    span < ALIGNED_DOT_MIN_SPAN
+                    or relative_deviation > ALIGNED_DOT_SPACING_REL_TOLERANCE
+                    or spacing_cv > ALIGNED_DOT_SPACING_MAX_CV
+                    or max_residual
+                    > max(
+                        2.0 * ALIGNED_DOT_TOLERANCE,
+                        run_spacing * ALIGNED_DOT_MAX_LATTICE_RESIDUAL_RATIO,
+                    )
+                ):
+                    continue
+
+                indices = tuple(sorted(item[2] for item in run))
+                score = (
+                    len(indices),
+                    span,
+                    -spacing_cv,
+                    -relative_deviation,
+                    -max_residual,
+                    -float(np.sum(slot_gaps - 1.0)),
+                )
+                previous = group_candidates.get(indices)
+                if previous is None or score > previous[0]:
+                    group_candidates[indices] = (score, run_spacing)
+
+    ordered_groups = sorted(
+        group_candidates.items(),
+        key=lambda item: (
+            -item[1][0][0],
+            -item[1][0][1],
+            -item[1][0][2],
+            -item[1][0][3],
+            -item[1][0][4],
+            -item[1][0][5],
+        ),
+    )
+    accepted_groups = []
+    for indices, details in ordered_groups:
+        index_set = set(indices)
+        if any(
+            len(index_set & set(accepted)) / min(len(indices), len(accepted)) >= 0.6
+            for accepted, _ in accepted_groups
+        ):
+            continue
+        accepted_groups.append((indices, details))
+    return {indices: details[0] for indices, details in accepted_groups}
+
+
 def group_aligned_dot_candidates(candidates):
-    """Return dot centers in near-straight, equally spaced groups of at least six."""
+    """Return individual centers in six-or-more-point, near-regular rows."""
     points = merge_dot_candidates(candidates)
     if len(points) < ALIGNED_DOT_MIN_COUNT:
         return []
 
-    # Pair hypotheses act as a deterministic RANSAC pass; the perpendicular
-    # tolerance allows scan variation without joining nearby rows.
-    tolerance = ALIGNED_DOT_TOLERANCE
-    max_gap = ALIGNED_DOT_MAX_GAP
-    min_span = ALIGNED_DOT_MIN_SPAN
-    group_candidates = {}
+    line_models = []
+    seen_models = set()
+    shared_axes = _dominant_dot_axes(points)
+    for shared_axis in shared_axes:
+        for model in _parallel_band_models(points, shared_axis):
+            if model not in seen_models:
+                seen_models.add(model)
+                line_models.append(model)
 
-    def add_chunk(chunk):
-        if len(chunk) < ALIGNED_DOT_MIN_COUNT:
-            return
-        for start in range(len(chunk) - ALIGNED_DOT_MIN_COUNT + 1):
-            for end in range(start + ALIGNED_DOT_MIN_COUNT, len(chunk) + 1):
-                run = chunk[start:end]
-                projections = [projection for projection, _ in run]
-                gaps = np.diff(projections)
-                median_gap = float(np.median(gaps))
-                if median_gap < ALIGNED_DOT_MIN_SPACING:
-                    continue
-                relative_deviation = float(
-                    np.max(np.abs(gaps - median_gap)) / median_gap
-                )
-                spacing_cv = float(np.std(gaps) / np.mean(gaps))
-                span = projections[-1] - projections[0]
-                if (
-                    span < min_span
-                    or relative_deviation > ALIGNED_DOT_SPACING_REL_TOLERANCE
-                    or spacing_cv > ALIGNED_DOT_SPACING_MAX_CV
-                ):
-                    continue
-                indices = tuple(sorted(point_index for _, point_index in run))
-                group_candidates[indices] = max(
-                    group_candidates.get(indices, 0.0), span
-                )
-
+    # Local pair hypotheses recover line fits at the edge of a parallel band.
+    # When shared directions exist, only those direction families are kept.
+    coordinates = np.asarray(
+        [[point["x"], point["y"]] for point in points], dtype=np.float64
+    )
     for first, second in itertools.combinations(range(len(points)), 2):
-        first_point = points[first]
-        second_point = points[second]
-        delta_x = second_point["x"] - first_point["x"]
-        delta_y = second_point["y"] - first_point["y"]
-        seed_distance = float(np.hypot(delta_x, delta_y))
+        delta = coordinates[second] - coordinates[first]
+        seed_distance = float(np.hypot(delta[0], delta[1]))
         if seed_distance < 24.0:
             continue
+        seed_axis = delta / seed_distance
+        if shared_axes:
+            angle_differences = [
+                np.degrees(
+                    np.arccos(
+                        np.clip(abs(float(np.dot(seed_axis, shared_axis))), -1.0, 1.0)
+                    )
+                )
+                for shared_axis in shared_axes
+            ]
+            if min(angle_differences) > ALIGNED_DOT_PARALLEL_ANGLE_TOLERANCE:
+                continue
+        normal = np.array([-delta[1], delta[0]], dtype=np.float64) / seed_distance
+        offsets = np.abs((coordinates - coordinates[first]) @ normal)
+        seed_indices = tuple(
+            int(index)
+            for index in np.flatnonzero(offsets <= ALIGNED_DOT_TOLERANCE)
+        )
+        if len(seed_indices) < ALIGNED_DOT_MIN_COUNT:
+            continue
+        model = _fit_aligned_dot_line(points, seed_indices)
+        if model is None:
+            continue
+        signature = model[0]
+        if signature not in seen_models:
+            seen_models.add(signature)
+            line_models.append(signature)
 
-        unit_x = delta_x / seed_distance
-        unit_y = delta_y / seed_distance
-        normal_x = -unit_y
-        normal_y = unit_x
-        inliers = []
-        for point_index, point in enumerate(points):
-            offset_x = point["x"] - first_point["x"]
-            offset_y = point["y"] - first_point["y"]
-            perpendicular_distance = abs(offset_x * normal_x + offset_y * normal_y)
-            if perpendicular_distance <= tolerance:
-                projection = offset_x * unit_x + offset_y * unit_y
-                inliers.append((projection, point_index))
-
-        inliers.sort()
-        chunk = []
-        for item in inliers:
-            if chunk and item[0] - chunk[-1][0] > max_gap:
-                add_chunk(chunk)
-                chunk = []
-            chunk.append(item)
-        add_chunk(chunk)
+    group_candidates = {}
+    for model in line_models:
+        model_points = np.asarray(
+            [[points[index]["x"], points[index]["y"]] for index in model],
+            dtype=np.float64,
+        )
+        center = model_points.mean(axis=0)
+        _, _, eigenvectors = np.linalg.svd(
+            model_points - center, full_matrices=False
+        )
+        axis = eigenvectors[0]
+        for indices, score in _regular_aligned_dot_groups(
+            points, model, center, axis
+        ).items():
+            previous = group_candidates.get(indices)
+            if previous is None or score > previous:
+                group_candidates[indices] = score
 
     ordered_groups = sorted(
-        group_candidates.items(), key=lambda item: (-len(item[0]), -item[1])
+        group_candidates.items(),
+        key=lambda item: (
+            -item[1][0],
+            -item[1][1],
+            -item[1][2],
+            -item[1][3],
+            -item[1][4],
+            -item[1][5],
+        ),
     )
     accepted_groups = []
     for indices, _ in ordered_groups:
         index_set = set(indices)
         if any(
-            len(index_set & set(accepted)) / min(len(indices), len(accepted)) >= 0.95
+            len(index_set & set(accepted)) / min(len(indices), len(accepted)) >= 0.6
             for accepted in accepted_groups
         ):
             continue
@@ -832,6 +1129,11 @@ def detect_all(tile, x0,y0, dot_candidates_out=None):
     dot_candidates = filter_dot_candidates_near_lines(
         detect_dot_candidates(tile, gray), line_segments
     )
+    # Reflection padding can invent centers just beyond the scan's top/left edge.
+    if x0 == 0:
+        dot_candidates = [point for point in dot_candidates if point["x"] >= 0.0]
+    if y0 == 0:
+        dot_candidates = [point for point in dot_candidates if point["y"] >= 0.0]
     if dot_candidates_out is None:
         aligned_dots = [
             (point["x"], point["y"], point["radius"])
