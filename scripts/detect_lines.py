@@ -30,7 +30,13 @@ def has_dashdot_pattern(tile_gray, x1,y1,x2,y2, th_img):
     return 4 <= transitions <= 14
 
 def detect_all(tile, x0,y0):
-    gray=cv2.cvtColor(tile, cv2.COLOR_BGR2GRAY)
+    # Blue/cyan marks are not a target class: mask them before the grayscale detectors.
+    hsv=cv2.cvtColor(tile, cv2.COLOR_BGR2HSV)
+    blue_mask=cv2.inRange(hsv, np.array([90,25,60]), np.array([128,255,255]))
+    blue_mask=cv2.dilate(blue_mask, np.ones((3,3),np.uint8), iterations=1)
+    tile_for_detection=tile.copy()
+    tile_for_detection[blue_mask > 0]=(255,255,255)
+    gray=cv2.cvtColor(tile_for_detection, cv2.COLOR_BGR2GRAY)
     clahe=cv2.createCLAHE(2.0,(8,8)); eq=clahe.apply(gray)
     th=cv2.adaptiveThreshold(eq,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY_INV,41,12)
     edges=cv2.Canny(cv2.morphologyEx(th,cv2.MORPH_OPEN, np.ones((3,3),np.uint8)),50,150)
@@ -48,14 +54,6 @@ def detect_all(tile, x0,y0):
         for x1,y1,x2,y2 in np.asarray(hlines).reshape(-1,4):
             length=float(np.hypot(x2-x1,y2-y1)); ang=float(np.degrees(np.arctan2(y2-y1,x2-x1)))
             out.append((x1+x0,y1+y0,x2+x0,y2+y0,length,ang,"straight", float(x1),float(y1),float(x2),float(y2)))
-    hsv=cv2.cvtColor(tile, cv2.COLOR_BGR2HSV)
-    mask=cv2.inRange(hsv, np.array([90,25,60]), np.array([128,255,255]))
-    mask=cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5,5),np.uint8), iterations=2)
-    blines=cv2.HoughLinesP(mask,1,np.pi/180,threshold=40,minLineLength=30,maxLineGap=25)
-    if blines is not None:
-        for x1,y1,x2,y2 in np.asarray(blines).reshape(-1,4):
-            length=float(np.hypot(x2-x1,y2-y1)); ang=float(np.degrees(np.arctan2(y2-y1,x2-x1)))
-            out.append((x1+x0,y1+y0,x2+x0,y2+y0,length,ang,"blue_dashed", float(x1),float(y1),float(x2),float(y2)))
     kernel=cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(10,10))
     mask_dil=cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=1)
     edges2=cv2.Canny(mask_dil,50,150)
@@ -67,7 +65,7 @@ def detect_all(tile, x0,y0):
             ang=float(np.degrees(np.arctan2(y2-y1,x2-x1)))
             if not (abs(ang) < 12 or 55 < abs(ang) < 80 or abs(abs(ang)-90) < 12):
                 continue
-            if has_dashdot_pattern(tile, x1,y1,x2,y2,th):
+            if has_dashdot_pattern(tile_for_detection, x1,y1,x2,y2,th):
                 out.append((x1+x0,y1+y0,x2+x0,y2+y0,length,ang,"dashdot", float(x1),float(y1),float(x2),float(y2)))
     contours,_=cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     for cnt in contours:
@@ -106,11 +104,11 @@ def main():
             seen.add(key)
             filtered.append({"x1":int(x1),"y1":int(y1),"x2":int(x2),"y2":int(y2),"length":round(length,1),"angle":round(ang,1),"type":typ,"tile":tid})
         all_lines.extend(filtered)
-        print(f"  {tid}: straight {len([x for x in filtered if x['type']=='straight'])} blue {len([x for x in filtered if x['type']=='blue_dashed'])} dashdot {len([x for x in filtered if x['type']=='dashdot'])} curved {len([x for x in filtered if x['type']=='curved'])}")
+        print(f"  {tid}: straight {len([x for x in filtered if x['type']=='straight'])} dashdot {len([x for x in filtered if x['type']=='dashdot'])} curved {len([x for x in filtered if x['type']=='curved'])}")
         dbg=tile.copy()
         for f in filtered:
             lx1,ly1=f["x1"]-x0, f["y1"]-y0; lx2,ly2=f["x2"]-x0, f["y2"]-y0
-            col=(0,165,255) if f["type"]=="dashdot" else (0,255,0) if f["type"]=="curved" else (255,0,0) if f["type"]=="blue_dashed" else (0,0,255)
+            col=(0,165,255) if f["type"]=="dashdot" else (0,255,0) if f["type"]=="curved" else (0,0,255)
             cv2.line(dbg,(int(lx1),int(ly1)),(int(lx2),int(ly2)),col,2)
         cv2.imwrite(os.path.join(args.debug_dir, f"debug_{tid}.jpg"), dbg)
     all_lines=sorted(all_lines, key=lambda x: x["length"], reverse=True)

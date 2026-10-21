@@ -42,10 +42,9 @@ TILE_NAME_RE = re.compile(
 
 # OpenCV colors are BGR.
 LINE_COLORS = {
-    "straight": (0, 0, 255),       # red
-    "curved": (0, 255, 0),         # green
-    "blue_dashed": (255, 0, 0),    # blue
-    "dashdot": (0, 165, 255),      # orange
+    "straight": (0, 0, 255),      # red
+    "curved": (0, 255, 0),        # green
+    "dashdot": (0, 165, 255),     # orange
 }
 
 
@@ -321,7 +320,7 @@ def run(
     print(f"CSV: {csv_path}")
     print(f"Полноразмерное наложение: {overlay_path}")
     print(f"Превью: {preview_path}")
-    print("Цвета: straight — красный, curved — зелёный, blue_dashed — синий, dashdot — оранжевый.")
+    print("Цвета: straight — красный, curved — зелёный, dashdot — оранжевый.")
 
 
 def main() -> int:
