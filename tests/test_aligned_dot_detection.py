@@ -12,6 +12,7 @@ import numpy as np
 from scripts.detect_lines import (
     filter_dot_candidates_near_lines,
     group_aligned_dot_candidates,
+    merge_dot_candidates,
 )
 from scripts.detect_tile_lines import (
     Tile,
@@ -65,6 +66,42 @@ class AlignedDotDetectionTests(unittest.TestCase):
         self.assertEqual(len(aligned_dots), 6)
         self.assertIn("Глобальная группировка точек", output.getvalue())
         self.assertIn("окно 1/", output.getvalue())
+        self.assertIn("готово; найдено точек=6", output.getvalue())
+
+    def test_point_filter_reports_index_and_candidate_progress(self) -> None:
+        candidates = [
+            {"x": float(x), "y": 100.0, "radius": 5.0, "area": 30}
+            for x in (30, 80, 130, 180, 230, 280)
+        ]
+        index_progress = []
+        candidate_progress = []
+
+        filtered = filter_dot_candidates_near_lines(
+            candidates,
+            [(0.0, 100.0, 350.0, 100.0)],
+            progress_callback=lambda done, total: candidate_progress.append(
+                (done, total)
+            ),
+            index_progress_callback=lambda done, total: index_progress.append(
+                (done, total)
+            ),
+        )
+
+        self.assertEqual(filtered, [])
+        self.assertEqual(index_progress[-1], (1, 1))
+        self.assertEqual(candidate_progress[-1], (6, 6))
+
+    def test_spatial_merge_keeps_transitive_clusters_and_threshold(self) -> None:
+        candidates = [
+            {"x": float(x), "y": 0.0, "radius": 3.0, "area": 1}
+            for x in (0.0, 8.0, 17.0, 30.0, 39.1)
+        ]
+
+        merged = merge_dot_candidates(candidates)
+
+        self.assertEqual(len(merged), 3)
+        self.assertAlmostEqual(merged[0]["x"], 25.0 / 3.0)
+        self.assertEqual([point["x"] for point in merged[1:]], [30.0, 39.1])
 
     def test_parallel_rows_allow_skipped_marks_but_keep_six_point_minimum(self) -> None:
         direction = np.array([0.4, 0.916515], dtype=np.float64)

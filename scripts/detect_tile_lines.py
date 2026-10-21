@@ -208,10 +208,17 @@ def group_dot_candidates_in_windows(
 
     aligned_dots = []
     dot_buckets: dict[tuple[int, int], list[int]] = {}
-    report_interval = max(1, math.ceil(len(window_items) / 20))
     for window_index, ((x_start, y_start), window_candidates) in enumerate(
         window_items, start=1
     ):
+        if report_progress:
+            print(
+                f"Глобальная группировка: окно {window_index}/{len(window_items)} "
+                f"({x_start},{y_start}), кандидатов={len(window_candidates)} — ",
+                end="",
+                flush=True,
+            )
+
         for dot in group_aligned_dot_candidates(window_candidates):
             cell_x = int(dot["x"] // 4)
             cell_y = int(dot["y"] // 4)
@@ -237,14 +244,9 @@ def group_dot_candidates_in_windows(
             elif dot["radius"] > aligned_dots[duplicate_index]["radius"]:
                 aligned_dots[duplicate_index]["radius"] = dot["radius"]
 
-        if report_progress and (
-            window_index % report_interval == 0 or window_index == len(window_items)
-        ):
+        if report_progress:
             print(
-                f"Глобальная группировка: окно {window_index}/{len(window_items)} "
-                f"({x_start},{y_start}), кандидатов={len(window_candidates)}, "
-                f"точек найдено={len(aligned_dots)}.",
-                flush=True,
+                f"готово; найдено точек={len(aligned_dots)}.", flush=True
             )
 
     return sorted(aligned_dots, key=lambda dot: (dot["y"], dot["x"]))
@@ -330,6 +332,13 @@ def detect_tiles(
         flush=True,
     )
 
+    def report_line_index_progress(processed: int, total: int) -> None:
+        if total < 1000 and processed != total:
+            return
+        interval = max(1, total // 20)
+        if processed == total or processed % interval == 0:
+            print(f"Индекс линий: сегменты {processed}/{total}.", flush=True)
+
     def report_line_filter_progress(processed: int, total: int) -> None:
         if total < 1000 and processed != total:
             return
@@ -337,10 +346,15 @@ def detect_tiles(
         if processed == total or processed % interval == 0:
             print(f"Проверка линий: кандидаты {processed}/{total}.", flush=True)
 
+    if existing_line_segments:
+        print("Строю пространственный индекс линейных сегментов...", flush=True)
+    else:
+        print("Линейных сегментов для фильтрации нет.", flush=True)
     candidates_off_lines = filter_dot_candidates_near_lines(
         in_bounds_dot_candidates,
         existing_line_segments,
         progress_callback=report_line_filter_progress,
+        index_progress_callback=report_line_index_progress,
     )
     print(
         f"После исключения точек на линиях осталось: "

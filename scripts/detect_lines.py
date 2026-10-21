@@ -594,7 +594,10 @@ def detect_dot_candidates(tile, gray):
 
 
 def filter_dot_candidates_near_lines(
-    candidates, line_segments, progress_callback=None
+    candidates,
+    line_segments,
+    progress_callback=None,
+    index_progress_callback=None,
 ):
     """Discard point centers that overlap a detected segment using a spatial index."""
     if not candidates or not line_segments:
@@ -606,8 +609,9 @@ def filter_dot_candidates_near_lines(
     )
     segment_cells = {}
     prepared_segments = []
+    index_report_interval = max(1, len(line_segments) // 20)
 
-    for segment_index, (x1, y1, x2, y2) in enumerate(line_segments):
+    for segment_index, (x1, y1, x2, y2) in enumerate(line_segments, start=1):
         delta_x = x2 - x1
         delta_y = y2 - y1
         length_squared = delta_x * delta_x + delta_y * delta_y
@@ -619,7 +623,13 @@ def filter_dot_candidates_near_lines(
         max_cell_y = int((max(y1, y2) + maximum_threshold) // cell_size)
         for cell_x in range(min_cell_x, max_cell_x + 1):
             for cell_y in range(min_cell_y, max_cell_y + 1):
-                segment_cells.setdefault((cell_x, cell_y), []).append(segment_index)
+                segment_cells.setdefault((cell_x, cell_y), []).append(segment_index - 1)
+
+        if index_progress_callback is not None and (
+            segment_index % index_report_interval == 0
+            or segment_index == len(line_segments)
+        ):
+            index_progress_callback(segment_index, len(line_segments))
 
     filtered = []
     report_interval = max(1, len(candidates) // 10)
@@ -663,6 +673,19 @@ def filter_dot_candidates_near_lines(
     return filtered
 
 
+def _nearby_candidate_pairs(points, cell_size):
+    """Yield each pair once when their spatial cells can be within cell_size."""
+    buckets = {}
+    for current_index, point in enumerate(points):
+        cell_x = int(point["x"] // cell_size)
+        cell_y = int(point["y"] // cell_size)
+        for bucket_x in range(cell_x - 1, cell_x + 2):
+            for bucket_y in range(cell_y - 1, cell_y + 2):
+                for previous_index in buckets.get((bucket_x, bucket_y), ()):
+                    yield previous_index, current_index
+        buckets.setdefault((cell_x, cell_y), []).append(current_index)
+
+
 def merge_dot_candidates(candidates):
     """Merge nearby component fragments so one printed mark counts as one dot."""
     if not candidates:
@@ -676,7 +699,9 @@ def merge_dot_candidates(candidates):
             index = parents[index]
         return index
 
-    for first, second in itertools.combinations(range(len(candidates)), 2):
+    for first, second in _nearby_candidate_pairs(
+        candidates, DOT_CANDIDATE_MERGE_DISTANCE
+    ):
         first_candidate = candidates[first]
         second_candidate = candidates[second]
         distance = float(
@@ -715,7 +740,11 @@ def _dominant_dot_axes(points):
     """Estimate the strongest shared orientations of parallel point rows."""
     angle_votes = np.zeros(180, dtype=np.float64)
     valid_pairs = 0
-    for first, second in itertools.combinations(points, 2):
+    for first_index, second_index in _nearby_candidate_pairs(
+        points, ALIGNED_DOT_MAX_GAP
+    ):
+        first = points[first_index]
+        second = points[second_index]
         delta_x = second["x"] - first["x"]
         delta_y = second["y"] - first["y"]
         distance = float(np.hypot(delta_x, delta_y))
