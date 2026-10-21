@@ -16,19 +16,6 @@ def split_into_tiles(img, cols, rows, overlap):
             tiles.append((img[y0:y1, x0:x1].copy(), x0,y0, f"r{r+1}c{c+1}_x{x0}_y{y0}"))
     return tiles
 
-def has_dashdot_pattern(tile_gray, x1,y1,x2,y2, th_img):
-    length=int(np.hypot(x2-x1,y2-y1))
-    if length < 60: return False
-    xs=np.linspace(x1,x2,100).astype(int); ys=np.linspace(y1,y2,100).astype(int)
-    h,w=th_img.shape[:2]
-    vals=[]
-    for x,y in zip(xs,ys):
-        if 0 <= y < h and 0 <= x < w:
-            vals.append(th_img[y,x] > 0)
-    if not vals: return False
-    transitions=sum(1 for i in range(1,len(vals)) if vals[i]!=vals[i-1])
-    return 4 <= transitions <= 14
-
 def detect_all(tile, x0,y0):
     # Blue/cyan marks are not a target class: mask them before the grayscale detectors.
     hsv=cv2.cvtColor(tile, cv2.COLOR_BGR2HSV)
@@ -54,19 +41,6 @@ def detect_all(tile, x0,y0):
         for x1,y1,x2,y2 in np.asarray(hlines).reshape(-1,4):
             length=float(np.hypot(x2-x1,y2-y1)); ang=float(np.degrees(np.arctan2(y2-y1,x2-x1)))
             out.append((x1+x0,y1+y0,x2+x0,y2+y0,length,ang,"straight", float(x1),float(y1),float(x2),float(y2)))
-    kernel=cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(10,10))
-    mask_dil=cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=1)
-    edges2=cv2.Canny(mask_dil,50,150)
-    dlines=cv2.HoughLinesP(edges2,1,np.pi/180,threshold=80,minLineLength=80,maxLineGap=30)
-    if dlines is not None:
-        for x1,y1,x2,y2 in np.asarray(dlines).reshape(-1,4):
-            length=float(np.hypot(x2-x1,y2-y1))
-            if length<80: continue
-            ang=float(np.degrees(np.arctan2(y2-y1,x2-x1)))
-            if not (abs(ang) < 12 or 55 < abs(ang) < 80 or abs(abs(ang)-90) < 12):
-                continue
-            if has_dashdot_pattern(tile_for_detection, x1,y1,x2,y2,th):
-                out.append((x1+x0,y1+y0,x2+x0,y2+y0,length,ang,"dashdot", float(x1),float(y1),float(x2),float(y2)))
     contours,_=cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     for cnt in contours:
         if cv2.arcLength(cnt, False) < 80: continue
@@ -104,11 +78,11 @@ def main():
             seen.add(key)
             filtered.append({"x1":int(x1),"y1":int(y1),"x2":int(x2),"y2":int(y2),"length":round(length,1),"angle":round(ang,1),"type":typ,"tile":tid})
         all_lines.extend(filtered)
-        print(f"  {tid}: straight {len([x for x in filtered if x['type']=='straight'])} dashdot {len([x for x in filtered if x['type']=='dashdot'])} curved {len([x for x in filtered if x['type']=='curved'])}")
+        print(f"  {tid}: straight {len([x for x in filtered if x['type']=='straight'])} curved {len([x for x in filtered if x['type']=='curved'])}")
         dbg=tile.copy()
         for f in filtered:
             lx1,ly1=f["x1"]-x0, f["y1"]-y0; lx2,ly2=f["x2"]-x0, f["y2"]-y0
-            col=(0,165,255) if f["type"]=="dashdot" else (0,255,0) if f["type"]=="curved" else (0,0,255)
+            col=(0,255,0) if f["type"]=="curved" else (0,0,255)
             cv2.line(dbg,(int(lx1),int(ly1)),(int(lx2),int(ly2)),col,2)
         cv2.imwrite(os.path.join(args.debug_dir, f"debug_{tid}.jpg"), dbg)
     all_lines=sorted(all_lines, key=lambda x: x["length"], reverse=True)

@@ -42,9 +42,8 @@ TILE_NAME_RE = re.compile(
 
 # OpenCV colors are BGR.
 LINE_COLORS = {
-    "straight": (0, 0, 255),      # red
-    "curved": (0, 255, 0),        # green
-    "dashdot": (0, 165, 255),     # orange
+    "straight": (0, 0, 255),  # red
+    "curved": (0, 255, 0),    # green
 }
 
 
@@ -204,7 +203,7 @@ def draw_overlay(
     overlay = source_image.copy()
 
     for line in lines:
-        color = LINE_COLORS.get(line["type"], (0, 255, 255))
+        color = LINE_COLORS.get(line["type"], (0, 0, 255))
         start = (line["x1"], line["y1"])
         end = (line["x2"], line["y2"])
         cv2.line(overlay, start, end, color, 2, cv2.LINE_AA)
@@ -223,7 +222,7 @@ def draw_overlay(
             interpolation=cv2.INTER_AREA,
         )
         for line in lines:
-            color = LINE_COLORS.get(line["type"], (0, 255, 255))
+            color = LINE_COLORS.get(line["type"], (0, 0, 255))
             start = (round(line["x1"] * scale), round(line["y1"] * scale))
             end = (round(line["x2"] * scale), round(line["y2"] * scale))
             cv2.line(preview, start, end, color, 2, cv2.LINE_AA)
@@ -320,7 +319,7 @@ def run(
     print(f"CSV: {csv_path}")
     print(f"Полноразмерное наложение: {overlay_path}")
     print(f"Превью: {preview_path}")
-    print("Цвета: straight — красный, curved — зелёный, dashdot — оранжевый.")
+    print("Цвета: straight — красный, curved — зелёный.")
 
 
 def main() -> int:
