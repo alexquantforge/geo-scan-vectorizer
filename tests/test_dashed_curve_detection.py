@@ -3,7 +3,7 @@ import unittest
 import cv2
 import numpy as np
 
-from scripts.detect_lines import detect_all
+from scripts.detect_lines import blue_cyan_mask, detect_all
 
 
 class DashedCurveDetectionTests(unittest.TestCase):
@@ -45,6 +45,31 @@ class DashedCurveDetectionTests(unittest.TestCase):
                 expected_x = 80 + 0.4 * local_y + 8 * np.sin(local_y / 60)
                 self.assertLess(abs(local_x - expected_x), 20)
                 self.assertGreater(abs(local_x - 440), 50)
+
+    def test_blue_mask_preserves_dark_ink_but_clears_saturated_blue(self) -> None:
+        image = np.full((500, 500, 3), (240, 230, 210), dtype=np.uint8)
+        cv2.line(image, (50, 50), (450, 450), (10, 10, 10), 3, cv2.LINE_AA)
+        cv2.line(image, (450, 50), (50, 450), (255, 0, 0), 4, cv2.LINE_AA)
+
+        mask = blue_cyan_mask(image)
+        self.assertEqual(mask[150, 150], 0)
+        self.assertEqual(mask[200, 300], 255)
+
+        detections = detect_all(image, 0, 0)
+        neutral_ink_lines = [
+            line
+            for line in detections
+            if line[6] in ("straight", "curved")
+            and max(abs(line[0] - line[1]), abs(line[2] - line[3])) < 20
+        ]
+        blue_overlay_lines = [
+            line
+            for line in detections
+            if line[6] in ("straight", "curved")
+            and max(abs(line[0] + line[1] - 500), abs(line[2] + line[3] - 500)) < 20
+        ]
+        self.assertTrue(neutral_ink_lines)
+        self.assertFalse(blue_overlay_lines)
 
     def test_grid_and_text_alone_do_not_form_a_dashed_curve(self) -> None:
         image = self.make_scan(with_curve=False)

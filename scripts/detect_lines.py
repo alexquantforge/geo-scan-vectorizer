@@ -30,6 +30,27 @@ def line_has_dark_support(ink_support, x1, y1, x2, y2, min_ratio=0.35):
     return support_ratio >= min_ratio
 
 
+def blue_cyan_mask(tile):
+    """Mask colored blue/cyan marks without whitening neutral dark ink.
+
+    Antialiased black strokes on cyan paper can inherit a blue hue. Preserve
+    pixels that are both dark and nearly neutral, including after mask dilation.
+    Strongly chromatic blue/cyan overlay lines remain masked.
+    """
+    hsv = cv2.cvtColor(tile, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(
+        hsv, np.array([90, 25, 60]), np.array([128, 255, 255])
+    )
+    gray = cv2.cvtColor(tile, cv2.COLOR_BGR2GRAY)
+    channels = tile.astype(np.int16)
+    channel_spread = channels.max(axis=2) - channels.min(axis=2)
+    dark_neutral_ink = (gray <= 110) & (channel_spread <= 55)
+    mask[dark_neutral_ink] = 0
+    mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=1)
+    mask[dark_neutral_ink] = 0
+    return mask
+
+
 def detect_dashed_curve_segments(gray, binary):
     """Join dark, similarly oriented components into oblique dashed curves.
 
@@ -227,12 +248,10 @@ def detect_dashed_curve_segments(gray, binary):
 
 
 def detect_all(tile, x0,y0):
-    # Blue/cyan marks are not a target class: mask them before the grayscale detectors.
-    hsv=cv2.cvtColor(tile, cv2.COLOR_BGR2HSV)
-    blue_mask=cv2.inRange(hsv, np.array([90,25,60]), np.array([128,255,255]))
-    blue_mask=cv2.dilate(blue_mask, np.ones((3,3),np.uint8), iterations=1)
-    tile_for_detection=tile.copy()
-    tile_for_detection[blue_mask > 0]=(255,255,255)
+    # Ignore colored blue/cyan marks, but retain dark neutral ink on cyan paper.
+    blue_mask = blue_cyan_mask(tile)
+    tile_for_detection = tile.copy()
+    tile_for_detection[blue_mask > 0] = (255, 255, 255)
     gray=cv2.cvtColor(tile_for_detection, cv2.COLOR_BGR2GRAY)
     dark_pixels=(gray <= 110).astype(np.uint8)
     ink_support=cv2.dilate(dark_pixels, np.ones((7,7),np.uint8), iterations=1)
