@@ -16,6 +16,20 @@ def split_into_tiles(img, cols, rows, overlap):
             tiles.append((img[y0:y1, x0:x1].copy(), x0,y0, f"r{r+1}c{c+1}_x{x0}_y{y0}"))
     return tiles
 
+def line_has_dark_support(ink_support, x1, y1, x2, y2, min_ratio=0.35):
+    """Require a candidate segment to follow actual dark ink, not just texture edges."""
+    h, w = ink_support.shape[:2]
+    length = float(np.hypot(x2 - x1, y2 - y1))
+    steps = max(12, int(np.ceil(length * 1.5)))
+    xs = np.rint(np.linspace(x1, x2, steps)).astype(int)
+    ys = np.rint(np.linspace(y1, y2, steps)).astype(int)
+    valid = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
+    if not np.any(valid):
+        return False
+    support_ratio = np.mean(ink_support[ys[valid], xs[valid]] > 0)
+    return support_ratio >= min_ratio
+
+
 def detect_all(tile, x0,y0):
     # Blue/cyan marks are not a target class: mask them before the grayscale detectors.
     hsv=cv2.cvtColor(tile, cv2.COLOR_BGR2HSV)
@@ -24,6 +38,8 @@ def detect_all(tile, x0,y0):
     tile_for_detection=tile.copy()
     tile_for_detection[blue_mask > 0]=(255,255,255)
     gray=cv2.cvtColor(tile_for_detection, cv2.COLOR_BGR2GRAY)
+    dark_pixels=(gray <= 110).astype(np.uint8)
+    ink_support=cv2.dilate(dark_pixels, np.ones((7,7),np.uint8), iterations=1)
     clahe=cv2.createCLAHE(2.0,(8,8)); eq=clahe.apply(gray)
     th=cv2.adaptiveThreshold(eq,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY_INV,41,12)
     edges=cv2.Canny(cv2.morphologyEx(th,cv2.MORPH_OPEN, np.ones((3,3),np.uint8)),50,150)
@@ -33,13 +49,14 @@ def detect_all(tile, x0,y0):
     if lines is not None:
         for x1,y1,x2,y2 in np.asarray(lines).reshape(-1,4):
             length=float(np.hypot(x2-x1,y2-y1))
-            if length<35: continue
+            if length<35 or not line_has_dark_support(ink_support,x1,y1,x2,y2): continue
             ang=float(np.degrees(np.arctan2(y2-y1,x2-x1)))
             out.append((x1+x0,y1+y0,x2+x0,y2+y0,length,ang,"straight", float(x1),float(y1),float(x2),float(y2)))
     hlines=cv2.HoughLinesP(edges,1,np.pi/180,threshold=70,minLineLength=50,maxLineGap=4)
     if hlines is not None:
         for x1,y1,x2,y2 in np.asarray(hlines).reshape(-1,4):
             length=float(np.hypot(x2-x1,y2-y1)); ang=float(np.degrees(np.arctan2(y2-y1,x2-x1)))
+            if not line_has_dark_support(ink_support,x1,y1,x2,y2): continue
             out.append((x1+x0,y1+y0,x2+x0,y2+y0,length,ang,"straight", float(x1),float(y1),float(x2),float(y2)))
     contours,_=cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     for cnt in contours:
@@ -50,7 +67,7 @@ def detect_all(tile, x0,y0):
         for i in range(len(pts)-1):
             x1,y1=pts[i]; x2,y2=pts[i+1]
             length=float(np.hypot(x2-x1,y2-y1))
-            if length<25: continue
+            if length<25 or not line_has_dark_support(ink_support,x1,y1,x2,y2): continue
             ang=float(np.degrees(np.arctan2(y2-y1,x2-x1)))
             out.append((float(x1+x0),float(y1+y0),float(x2+x0),float(y2+y0),length,ang,"curved", float(x1),float(y1),float(x2),float(y2)))
     return out
