@@ -22,8 +22,6 @@ DOT_CANDIDATE_MERGE_DISTANCE = 9.0
 ALIGNED_DOT_MIN_LINE_CLEARANCE = 20.0
 DOT_LINE_FILTER_MIN_SEGMENT_LENGTH = 20.0
 DOT_CANDIDATE_INTENSITY_THRESHOLD = 100
-DOT_LINE_CONTINUITY_SUPPORT_THRESHOLD = 0.65
-DOT_LINE_INK_THRESHOLD = 110
 
 
 def split_into_tiles(img, cols, rows, overlap):
@@ -606,54 +604,47 @@ def detect_dot_candidates(tile, gray, dot_gray=None):
     return candidates
 
 
-def _line_has_continuous_support_near_candidate(
-    gray_image, candidate, nearest_x, nearest_y, delta_x, delta_y
-):
-    """Check whether the nearby line continues beyond the compact mark."""
-    if gray_image is None:
-        return True
+def dominant_line_axis(line_segments):
+    """Return the dominant unoriented axis of the detected linear features."""
+    angles = []
+    weights = []
+    for x1, y1, x2, y2 in line_segments:
+        delta_x = x2 - x1
+        delta_y = y2 - y1
+        length = float(np.hypot(delta_x, delta_y))
+        if length < DOT_LINE_FILTER_MIN_SEGMENT_LENGTH:
+            continue
+        angle = (float(np.degrees(np.arctan2(delta_y, delta_x))) + 90.0) % 180.0 - 90.0
+        angles.append(angle)
+        weights.append(length)
 
-    segment_length = float(np.hypot(delta_x, delta_y))
-    if segment_length <= 0.0:
-        return True
+    if not angles:
+        return None
 
-    tangent = np.array([delta_x, delta_y], dtype=np.float64) / segment_length
-    normal = np.array([-tangent[1], tangent[0]])
-    start_distance = max(5.0, float(candidate["radius"]) + 2.0)
-    end_distance = max(
-        ALIGNED_DOT_MIN_LINE_CLEARANCE,
-        float(candidate["radius"]) * 1.5,
+    angles = np.asarray(angles, dtype=np.float64)
+    weights = np.asarray(weights, dtype=np.float64)
+    centers = np.arange(-90.0, 90.0, 1.0)
+    support = np.asarray(
+        [
+            np.sum(
+                weights[
+                    np.abs((angles - center + 90.0) % 180.0 - 90.0)
+                    <= ALIGNED_DOT_PARALLEL_ANGLE_TOLERANCE
+                ]
+            )
+            for center in centers
+        ],
+        dtype=np.float64,
     )
-    distances = np.arange(start_distance, end_distance + 0.1, 2.0)
-    if len(distances) < 3:
-        return True
-
-    height, width = gray_image.shape[:2]
-    support_by_side = []
-    for side in (-1.0, 1.0):
-        supported_samples = 0
-        valid_samples = 0
-        for distance in distances:
-            point = np.array([nearest_x, nearest_y]) + side * tangent * distance
-            has_dark_ink = False
-            has_valid_pixel = False
-            for normal_offset in (-2, -1, 0, 1, 2):
-                sample = point + normal * normal_offset
-                x = int(round(float(sample[0])))
-                y = int(round(float(sample[1])))
-                if 0 <= x < width and 0 <= y < height:
-                    has_valid_pixel = True
-                    if gray_image[y, x] <= DOT_LINE_INK_THRESHOLD:
-                        has_dark_ink = True
-                        break
-            if has_valid_pixel:
-                valid_samples += 1
-                supported_samples += int(has_dark_ink)
-        if valid_samples < 3:
-            return True
-        support_by_side.append(supported_samples / valid_samples)
-
-    return min(support_by_side) >= DOT_LINE_CONTINUITY_SUPPORT_THRESHOLD
+    dominant_center = centers[int(np.argmax(support))]
+    differences = np.abs((angles - dominant_center + 90.0) % 180.0 - 90.0)
+    selected = differences <= ALIGNED_DOT_PARALLEL_ANGLE_TOLERANCE
+    doubled_angles = np.radians(2.0 * angles[selected])
+    mean_angle = 0.5 * np.arctan2(
+        np.sum(weights[selected] * np.sin(doubled_angles)),
+        np.sum(weights[selected] * np.cos(doubled_angles)),
+    )
+    return np.array([np.cos(mean_angle), np.sin(mean_angle)], dtype=np.float64)
 
 
 def filter_dot_candidates_near_lines(
@@ -661,7 +652,6 @@ def filter_dot_candidates_near_lines(
     line_segments,
     progress_callback=None,
     index_progress_callback=None,
-    gray_image=None,
 ):
     """Discard point centers too close to detected segments via spatial indexing."""
     if not candidates or not line_segments:
@@ -712,7 +702,6 @@ def filter_dot_candidates_near_lines(
                 segment_index
             ]
             if length_squared == 0:
-                nearest_x, nearest_y = x1, y1
                 distance = float(
                     np.hypot(candidate["x"] - x1, candidate["y"] - y1)
                 )
@@ -727,14 +716,7 @@ def filter_dot_candidates_near_lines(
                 distance = float(
                     np.hypot(candidate["x"] - nearest_x, candidate["y"] - nearest_y)
                 )
-            if distance <= threshold and _line_has_continuous_support_near_candidate(
-                gray_image,
-                candidate,
-                nearest_x,
-                nearest_y,
-                delta_x,
-                delta_y,
-            ):
+            if distance <= threshold:
                 on_line = True
                 break
         if not on_line:
@@ -1101,15 +1083,22 @@ def _regular_aligned_dot_groups(points, line_indices, center, axis):
     return {indices: details[0] for indices, details in accepted_groups}
 
 
-def group_aligned_dot_candidates(candidates):
-    """Return individual centers in six-or-more-point, near-regular rows."""
+def group_aligned_dot_candidates(candidates, preferred_axis=None):
+    """Return regular dot rows, optionally constrained to a detected line axis."""
     points = merge_dot_candidates(candidates)
     if len(points) < ALIGNED_DOT_MIN_COUNT:
         return []
 
     line_models = []
     seen_models = set()
-    shared_axes = _dominant_dot_axes(points)
+    if preferred_axis is None:
+        shared_axes = _dominant_dot_axes(points)
+    else:
+        preferred_axis = np.asarray(preferred_axis, dtype=np.float64)
+        axis_length = float(np.hypot(preferred_axis[0], preferred_axis[1]))
+        shared_axes = (
+            [preferred_axis / axis_length] if axis_length > 0.0 else _dominant_dot_axes(points)
+        )
     for shared_axis in shared_axes:
         for model in _parallel_band_models(points, shared_axis):
             if model not in seen_models:
@@ -1277,10 +1266,9 @@ def detect_all(tile, x0, y0, dot_candidates_out=None):
     ]
     dot_gray = dot_candidate_grayscale(tile, gray)
     dot_candidates = filter_dot_candidates_near_lines(
-        detect_dot_candidates(tile, gray, dot_gray),
-        line_segments,
-        gray_image=dot_gray,
+        detect_dot_candidates(tile, gray, dot_gray), line_segments
     )
+    preferred_axis = dominant_line_axis(line_segments)
     # Reflection padding can invent centers just beyond the scan's top/left edge.
     if x0 == 0:
         dot_candidates = [point for point in dot_candidates if point["x"] >= 0.0]
@@ -1289,7 +1277,9 @@ def detect_all(tile, x0, y0, dot_candidates_out=None):
     if dot_candidates_out is None:
         aligned_dots = [
             (point["x"], point["y"], point["radius"])
-            for point in group_aligned_dot_candidates(dot_candidates)
+            for point in group_aligned_dot_candidates(
+                dot_candidates, preferred_axis=preferred_axis
+            )
         ]
     else:
         aligned_dots = []

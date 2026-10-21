@@ -11,13 +11,13 @@ import numpy as np
 
 from scripts.detect_lines import (
     detect_dot_candidates,
+    dominant_line_axis,
     filter_dot_candidates_near_lines,
     group_aligned_dot_candidates,
     merge_dot_candidates,
 )
 from scripts.detect_tile_lines import (
     Tile,
-    _TiledDotCandidateGray,
     detect_tiles,
     draw_overlay,
     group_dot_candidates_in_windows,
@@ -113,50 +113,71 @@ class AlignedDotDetectionTests(unittest.TestCase):
 
         self.assertEqual(filtered, [clear_of_line])
 
-    def test_dotted_marks_on_line_are_kept_but_solid_line_is_rejected(self) -> None:
-        source = np.full((180, 360, 3), 225, dtype=np.uint8)
-        centers = [(40 + 50 * index, 90) for index in range(6)]
-        for center in centers:
-            cv2.circle(source, center, 4, (90, 90, 90), -1, cv2.LINE_AA)
+    def test_parallel_dots_are_kept_only_when_offset_from_the_line(self) -> None:
+        source = np.full((280, 360, 3), 225, dtype=np.uint8)
+        direction = np.array([np.cos(np.deg2rad(30)), np.sin(np.deg2rad(30))])
+        normal = np.array([-direction[1], direction[0]])
+        origin = np.array([50.0, 40.0])
+        line_start = origin - direction * 50
+        line_end = origin + direction * 300
+        line_segment = (
+            float(line_start[0]),
+            float(line_start[1]),
+            float(line_end[0]),
+            float(line_end[1]),
+        )
+        offset_centers = [
+            origin + direction * (50 * index) + normal * 35
+            for index in range(6)
+        ]
+        for center in offset_centers:
+            cv2.circle(
+                source,
+                tuple(np.rint(center).astype(int)),
+                4,
+                (90, 90, 90),
+                -1,
+                cv2.LINE_AA,
+            )
         gray = cv2.cvtColor(source, cv2.COLOR_BGR2GRAY)
         candidates = detect_dot_candidates(source, gray)
-        line_segment = [(40.0, 90.0, 290.0, 90.0)]
-
-        kept_dots = filter_dot_candidates_near_lines(
-            candidates, line_segment, gray_image=gray
+        filtered = filter_dot_candidates_near_lines(candidates, [line_segment])
+        preferred_axis = dominant_line_axis([line_segment])
+        decoy_direction = np.array(
+            [np.cos(np.deg2rad(-30)), np.sin(np.deg2rad(-30))]
         )
+        nonparallel_decoys = [
+            {
+                "x": float(50 + decoy_direction[0] * 50 * index),
+                "y": float(400 + decoy_direction[1] * 50 * index),
+                "radius": 4.5,
+                "area": 30,
+            }
+            for index in range(6)
+        ]
+        grouped = group_aligned_dot_candidates(
+            filtered + nonparallel_decoys, preferred_axis=preferred_axis
+        )
+
         self.assertEqual(len(candidates), 6)
-        self.assertEqual(len(kept_dots), 6)
-        self.assertEqual(len(group_aligned_dot_candidates(kept_dots)), 6)
-
-        solid_gray = gray.copy()
-        cv2.line(solid_gray, (20, 90), (310, 90), 20, 2, cv2.LINE_AA)
-        self.assertEqual(
-            filter_dot_candidates_near_lines(
-                candidates, line_segment, gray_image=solid_gray
-            ),
-            [],
+        self.assertEqual(len(filtered), 6)
+        self.assertEqual(len(grouped), 6)
+        self.assertAlmostEqual(
+            np.degrees(np.arctan2(preferred_axis[1], preferred_axis[0])), 30.0, places=1
         )
 
-    def test_global_line_filter_reads_support_across_tile_seams(self) -> None:
-        source = np.full((80, 100, 3), 225, dtype=np.uint8)
-        cv2.line(source, (20, 40), (80, 40), (20, 20, 20), 2, cv2.LINE_AA)
-        candidate = {"x": 50.0, "y": 40.0, "radius": 4.5, "area": 30}
-
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory)
-            tiles = []
-            for x0, x1 in ((0, 49), (50, 99)):
-                path = root / f"{x0:05d}_00000_{x1:05d}_00079.png"
-                self.assertTrue(cv2.imwrite(str(path), source[:, x0 : x1 + 1]))
-                tiles.append(Tile(path, x0, 0, x1, 79))
-
-            gray_source = _TiledDotCandidateGray(tiles, width=100, height=80)
-            filtered = filter_dot_candidates_near_lines(
-                [candidate], [(20.0, 40.0, 80.0, 40.0)], gray_image=gray_source
-            )
-
-        self.assertEqual(filtered, [])
+        on_line_candidates = [
+            {
+                "x": float((origin + direction * (50 * index))[0]),
+                "y": float((origin + direction * (50 * index))[1]),
+                "radius": 4.5,
+                "area": 30,
+            }
+            for index in range(6)
+        ]
+        self.assertEqual(
+            filter_dot_candidates_near_lines(on_line_candidates, [line_segment]), []
+        )
 
     def test_spatial_merge_keeps_transitive_clusters_and_threshold(self) -> None:
         candidates = [
