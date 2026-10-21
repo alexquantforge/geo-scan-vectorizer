@@ -38,14 +38,14 @@ def detect_all(tile, x0,y0):
     lsd=cv2.createLineSegmentDetector()
     lines,_,_,_=lsd.detect(gray)
     if lines is not None:
-        for l in lines:
-            x1,y1,x2,y2=l[0]; length=float(np.hypot(x2-x1,y2-y1))
+        for x1,y1,x2,y2 in np.asarray(lines).reshape(-1,4):
+            length=float(np.hypot(x2-x1,y2-y1))
             if length<35: continue
             ang=float(np.degrees(np.arctan2(y2-y1,x2-x1)))
             out.append((x1+x0,y1+y0,x2+x0,y2+y0,length,ang,"straight", float(x1),float(y1),float(x2),float(y2)))
     hlines=cv2.HoughLinesP(edges,1,np.pi/180,threshold=70,minLineLength=50,maxLineGap=4)
     if hlines is not None:
-        for x1,y1,x2,y2 in [l[0] for l in hlines]:
+        for x1,y1,x2,y2 in np.asarray(hlines).reshape(-1,4):
             length=float(np.hypot(x2-x1,y2-y1)); ang=float(np.degrees(np.arctan2(y2-y1,x2-x1)))
             out.append((x1+x0,y1+y0,x2+x0,y2+y0,length,ang,"straight", float(x1),float(y1),float(x2),float(y2)))
     hsv=cv2.cvtColor(tile, cv2.COLOR_BGR2HSV)
@@ -53,7 +53,7 @@ def detect_all(tile, x0,y0):
     mask=cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5,5),np.uint8), iterations=2)
     blines=cv2.HoughLinesP(mask,1,np.pi/180,threshold=40,minLineLength=30,maxLineGap=25)
     if blines is not None:
-        for x1,y1,x2,y2 in [l[0] for l in blines]:
+        for x1,y1,x2,y2 in np.asarray(blines).reshape(-1,4):
             length=float(np.hypot(x2-x1,y2-y1)); ang=float(np.degrees(np.arctan2(y2-y1,x2-x1)))
             out.append((x1+x0,y1+y0,x2+x0,y2+y0,length,ang,"blue_dashed", float(x1),float(y1),float(x2),float(y2)))
     kernel=cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(10,10))
@@ -61,7 +61,7 @@ def detect_all(tile, x0,y0):
     edges2=cv2.Canny(mask_dil,50,150)
     dlines=cv2.HoughLinesP(edges2,1,np.pi/180,threshold=80,minLineLength=80,maxLineGap=30)
     if dlines is not None:
-        for x1,y1,x2,y2 in [l[0] for l in dlines]:
+        for x1,y1,x2,y2 in np.asarray(dlines).reshape(-1,4):
             length=float(np.hypot(x2-x1,y2-y1))
             if length<80: continue
             ang=float(np.degrees(np.arctan2(y2-y1,x2-x1)))
