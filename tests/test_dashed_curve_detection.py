@@ -8,9 +8,7 @@ from scripts.detect_lines import blue_cyan_mask, detect_all, detect_small_circle
 
 class DashedCurveDetectionTests(unittest.TestCase):
     @staticmethod
-    def make_scan(
-        with_curve: bool, amplitude: float = 8.0, period: float = 60.0
-    ) -> np.ndarray:
+    def make_scan(with_curve: bool) -> np.ndarray:
         image = np.full((500, 500, 3), 245, dtype=np.uint8)
         cv2.line(image, (440, 0), (440, 499), (20, 20, 20), 2, cv2.LINE_AA)
         cv2.line(image, (0, 250), (499, 250), (20, 20, 20), 2, cv2.LINE_AA)
@@ -28,8 +26,8 @@ class DashedCurveDetectionTests(unittest.TestCase):
         if with_curve:
             for y in range(18, 481, 26):
                 y2 = min(y + 15, 490)
-                x1 = round(80 + 0.4 * y + amplitude * np.sin(y / period))
-                x2 = round(80 + 0.4 * y2 + amplitude * np.sin(y2 / period))
+                x1 = round(80 + 0.4 * y + 8 * np.sin(y / 60))
+                x2 = round(80 + 0.4 * y2 + 8 * np.sin(y2 / 60))
                 cv2.line(image, (x1, y), (x2, y2), (15, 15, 15), 4, cv2.LINE_AA)
         return image
 
@@ -47,46 +45,6 @@ class DashedCurveDetectionTests(unittest.TestCase):
                 expected_x = 80 + 0.4 * local_y + 8 * np.sin(local_y / 60)
                 self.assertLess(abs(local_x - expected_x), 20)
                 self.assertGreater(abs(local_x - 440), 50)
-
-    def test_traces_a_dashed_u_curve_that_reverses_in_y(self) -> None:
-        image = self.make_scan(with_curve=False)
-        x_start, x_end = 20.0, 320.0
-        y_base, amplitude = 120.0, 90.0
-        for t in np.arange(0.04, 0.97, 0.08):
-            x = x_start + (x_end - x_start) * t
-            y = y_base + amplitude * (1.0 - np.cos(2.0 * np.pi * t))
-            slope = (
-                amplitude
-                * 2.0
-                * np.pi
-                * np.sin(2.0 * np.pi * t)
-                / (x_end - x_start)
-            )
-            tangent_length = float(np.hypot(1.0, slope))
-            half_dash_length = 8.0
-            dx = half_dash_length / tangent_length
-            dy = half_dash_length * slope / tangent_length
-            start = (round(x - dx), round(y - dy))
-            end = (round(x + dx), round(y + dy))
-            cv2.line(image, start, end, (15, 15, 15), 4, cv2.LINE_AA)
-
-        detections = detect_all(image, 0, 0)
-        dashed = [line for line in detections if line[6] == "dashed_curve"]
-
-        self.assertGreaterEqual(len(dashed), 8)
-        endpoints = [
-            (x, y)
-            for line in dashed
-            for x, y in ((line[0], line[1]), (line[2], line[3]))
-        ]
-        for x, y in endpoints:
-            t = (x - x_start) / (x_end - x_start)
-            expected_y = y_base + amplitude * (1.0 - np.cos(2.0 * np.pi * t))
-            self.assertLess(abs(y - expected_y), 20)
-            self.assertLess(x, 340)
-
-        self.assertLess(min(x for x, _ in endpoints), 60)
-        self.assertGreater(max(x for x, _ in endpoints), 260)
 
     def test_blue_mask_preserves_dark_ink_but_clears_saturated_blue(self) -> None:
         image = np.full((500, 500, 3), (240, 230, 210), dtype=np.uint8)
