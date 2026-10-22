@@ -72,13 +72,18 @@ def blue_cyan_mask(tile):
     return mask
 
 
-def detect_dashed_curve_segments(gray, binary):
-    """Join dark, similarly oriented components into oblique dashed curves.
+DASHED_CURVE_MIN_NODES = 4
+DASHED_CURVE_MIN_PROGRESS_SPAN = 60.0
+DASHED_CURVE_MIN_PATH_LENGTH = 120.0
+DASHED_CURVE_MAX_EDGE_TURN = 120.0
+DASHED_CURVE_MAX_MEAN_TURN = 65.0
+DASHED_CURVE_MAX_CROSS_PROGRESS_RATIO = 1.5
+DASHED_CURVE_COMPONENT_AXIS_TOLERANCE = 65.0
+DASHED_CURVE_MIN_LINE_SUPPORT_RATIO = 0.3
 
-    Long horizontal/vertical grid lines are removed first. The component support
-    threshold rejects pale paper texture, while the path constraints favor a
-    smooth run of dark dashes over isolated symbols and lettering.
-    """
+
+def _trace_dashed_curve_segments_in_y_direction(gray, binary):
+    """Trace a chain of dark dashes whose progress is monotone in image y."""
     height, width = gray.shape[:2]
     if min(height, width) < 80:
         return []
@@ -152,17 +157,19 @@ def detect_dashed_curve_segments(gray, binary):
             }
         )
 
-    if len(nodes) < 6:
+    if len(nodes) < DASHED_CURVE_MIN_NODES:
         return []
     nodes.sort(key=lambda node: (node["y"], node["x"]))
 
-    # Build a forward graph in the dominant vertical direction. The target
-    # boundary is oblique, so the overall slope constraint rejects the long
-    # near-vertical grid remnants that survive local thresholding.
+    # Build a forward graph in y. The line-support and component-orientation
+    # checks keep nearby text strokes from linking into arbitrary paths.
     successors = [[] for _ in nodes]
     predecessors = [[] for _ in nodes]
     max_vertical_gap = 120
     max_distance = 140
+    axis_alignment_limit = np.cos(
+        np.deg2rad(DASHED_CURVE_COMPONENT_AXIS_TOLERANCE)
+    )
     for index, first in enumerate(nodes):
         for next_index in range(index + 1, len(nodes)):
             second = nodes[next_index]
@@ -179,9 +186,9 @@ def detect_dashed_curve_segments(gray, binary):
             direction = np.array([delta_x, delta_y], dtype=np.float32) / distance
             align_first = abs(float(np.dot(first["axis"], direction)))
             align_second = abs(float(np.dot(second["axis"], direction)))
-            if align_first < np.cos(np.deg2rad(35)):
+            if align_first < axis_alignment_limit:
                 continue
-            if align_second < np.cos(np.deg2rad(40)):
+            if align_second < axis_alignment_limit:
                 continue
             if not line_has_dark_support(
                 line_support,
@@ -189,7 +196,7 @@ def detect_dashed_curve_segments(gray, binary):
                 first["y"],
                 second["x"],
                 second["y"],
-                min_ratio=0.5,
+                min_ratio=DASHED_CURVE_MIN_LINE_SUPPORT_RATIO,
             ):
                 continue
 
@@ -199,8 +206,9 @@ def detect_dashed_curve_segments(gray, binary):
             )
             predecessors[next_index].append(index)
 
-    # Dynamic programming over pairs preserves the incoming direction so a
-    # zig-zag through adjacent text strokes cannot win just by having many blobs.
+    # Dynamic programming over pairs preserves the incoming direction, while
+    # allowing a path to turn smoothly instead of requiring an almost-straight
+    # chain. A second pass on a rotated image handles curves that reverse in y.
     states = {}
     for index in range(len(nodes)):
         for next_index, distance, align_first, align_second, angle in successors[index]:
@@ -213,13 +221,9 @@ def detect_dashed_curve_segments(gray, binary):
                     continue
                 previous_score, path, previous_angle, total_turn = previous
                 turn = abs((angle - previous_angle + 180) % 360 - 180)
-                if turn > 75:
+                if turn > DASHED_CURVE_MAX_EDGE_TURN:
                     continue
-                score = (
-                    previous_score
-                    + edge_score
-                    - 0.04 * turn
-                )
+                score = previous_score + edge_score - 0.04 * turn
                 if score > states[(index, next_index)][0]:
                     states[(index, next_index)] = (
                         score,
@@ -232,24 +236,45 @@ def detect_dashed_curve_segments(gray, binary):
     for score, path, _, total_turn in states.values():
         first = nodes[path[0]]
         last = nodes[path[-1]]
-        vertical_span = last["y"] - first["y"]
-        if len(path) < 6 or vertical_span < 150:
+        progress_span = last["y"] - first["y"]
+        if (
+            len(path) < DASHED_CURVE_MIN_NODES
+            or progress_span < DASHED_CURVE_MIN_PROGRESS_SPAN
+        ):
             continue
-        slope_ratio = abs(last["x"] - first["x"]) / max(vertical_span, 1.0)
+        path_length = sum(
+            float(
+                np.hypot(
+                    nodes[second]["x"] - nodes[first_index]["x"],
+                    nodes[second]["y"] - nodes[first_index]["y"],
+                )
+            )
+            for first_index, second in zip(path, path[1:])
+        )
+        if path_length < DASHED_CURVE_MIN_PATH_LENGTH:
+            continue
+        cross_progress_ratio = abs(last["x"] - first["x"]) / max(progress_span, 1.0)
         mean_turn = total_turn / max(len(path) - 2, 1)
-        if not (0.2 <= slope_ratio <= 1.5) or mean_turn > 9:
+        if (
+            cross_progress_ratio > DASHED_CURVE_MAX_CROSS_PROGRESS_RATIO
+            or mean_turn > DASHED_CURVE_MAX_MEAN_TURN
+            or (len(path) < 6 and total_turn < 35.0)
+        ):
             continue
-        candidates.append((score + 0.02 * vertical_span, path))
+        candidates.append((score + 0.02 * progress_span, path))
 
     candidates.sort(key=lambda candidate: candidate[0], reverse=True)
     selected_paths = []
-    used_nodes = set()
+    selected_node_sets = []
     for _, path in candidates:
-        overlap = len(set(path) & used_nodes) / len(path)
-        if overlap > 0.5:
+        path_nodes = set(path)
+        if any(
+            len(path_nodes & accepted) / min(len(path_nodes), len(accepted)) > 0.5
+            for accepted in selected_node_sets
+        ):
             continue
         selected_paths.append(path)
-        used_nodes.update(path)
+        selected_node_sets.append(path_nodes)
 
     segments = []
     for path in selected_paths:
@@ -266,6 +291,87 @@ def detect_dashed_curve_segments(gray, binary):
                 (first["x"], first["y"], second["x"], second["y"], length, angle)
             )
     return segments
+
+
+def detect_dashed_curve_segments(gray, binary):
+    """Trace curved dashed paths in either dominant image direction.
+
+    The ordinary pass follows increasing y. A 90-degree clockwise pass also
+    follows increasing source x, so a real curve can reverse vertically without
+    being broken into unrelated fragments. Only paths with multiple ink-backed,
+    similarly oriented dashes are retained.
+    """
+    height, _ = gray.shape[:2]
+    segments = _trace_dashed_curve_segments_in_y_direction(gray, binary)
+
+    rotated_gray = cv2.rotate(gray, cv2.ROTATE_90_CLOCKWISE)
+    rotated_binary = cv2.rotate(binary, cv2.ROTATE_90_CLOCKWISE)
+    for x1, y1, x2, y2, _, _ in _trace_dashed_curve_segments_in_y_direction(
+        rotated_gray, rotated_binary
+    ):
+        # For a clockwise 90-degree rotation: x'=height-1-y, y'=x.
+        original_x1, original_y1 = y1, height - 1 - x1
+        original_x2, original_y2 = y2, height - 1 - x2
+        length = float(
+            np.hypot(original_x2 - original_x1, original_y2 - original_y1)
+        )
+        angle = float(
+            np.degrees(
+                np.arctan2(original_y2 - original_y1, original_x2 - original_x1)
+            )
+        )
+        segments.append(
+            (original_x1, original_y1, original_x2, original_y2, length, angle)
+        )
+
+    def traces_same_ink(first, second):
+        x1, y1, x2, y2 = first[:4]
+        a1, b1, a2, b2 = second[:4]
+        direct_error = max(
+            float(np.hypot(x1 - a1, y1 - b1)),
+            float(np.hypot(x2 - a2, y2 - b2)),
+        )
+        reverse_error = max(
+            float(np.hypot(x1 - a2, y1 - b2)),
+            float(np.hypot(x2 - a1, y2 - b1)),
+        )
+        if min(direct_error, reverse_error) <= 3.0:
+            return True
+
+        first_vector = np.array([x2 - x1, y2 - y1], dtype=np.float64)
+        second_vector = np.array([a2 - a1, b2 - b1], dtype=np.float64)
+        first_length = float(np.hypot(first_vector[0], first_vector[1]))
+        second_length = float(np.hypot(second_vector[0], second_vector[1]))
+        if min(first_length, second_length) < 8.0:
+            return False
+        first_unit = first_vector / first_length
+        second_unit = second_vector / second_length
+        if abs(float(np.dot(first_unit, second_unit))) < np.cos(np.deg2rad(15.0)):
+            return False
+
+        perpendicular_distances = [
+            abs((point_x - x1) * first_unit[1] - (point_y - y1) * first_unit[0])
+            for point_x, point_y in ((a1, b1), (a2, b2))
+        ]
+        if max(perpendicular_distances) > 4.0:
+            return False
+
+        projections = [
+            float(np.dot(np.array([point_x - x1, point_y - y1]), first_unit))
+            for point_x, point_y in ((a1, b1), (a2, b2))
+        ]
+        overlap = max(
+            0.0,
+            min(first_length, max(projections)) - max(0.0, min(projections)),
+        )
+        return overlap / min(first_length, second_length) >= 0.65
+
+    unique_segments = []
+    for segment in segments:
+        if any(traces_same_ink(segment, existing) for existing in unique_segments):
+            continue
+        unique_segments.append(segment)
+    return unique_segments
 
 
 def detect_small_circles(gray, binary):
