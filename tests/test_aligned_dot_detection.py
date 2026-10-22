@@ -105,7 +105,7 @@ class AlignedDotDetectionTests(unittest.TestCase):
 
     def test_dot_candidates_keep_a_clearance_from_detected_lines(self) -> None:
         near_line = {"x": 100.0, "y": 115.0, "radius": 5.0, "area": 30}
-        clear_of_line = {"x": 200.0, "y": 121.0, "radius": 5.0, "area": 30}
+        clear_of_line = {"x": 200.0, "y": 116.0, "radius": 5.0, "area": 30}
 
         filtered = filter_dot_candidates_near_lines(
             [near_line, clear_of_line], [(0.0, 100.0, 300.0, 100.0)]
