@@ -11,7 +11,7 @@ import re
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 try:
     import cv2
@@ -261,35 +261,80 @@ def group_dot_candidates_in_windows(
     return sorted(aligned_dots, key=lambda dot: (dot["y"], dot["x"]))
 
 
+def _detect_tile_candidates(
+    tile_info: Tile,
+) -> tuple[list[tuple[Any, ...]], list[dict[str, float]]]:
+    """Run the detector on one tile (module level so processes can pickle it)."""
+    tile_image = cv2.imread(str(tile_info.path), cv2.IMREAD_COLOR)
+    if tile_image is None:
+        raise ValueError(f"OpenCV не смог прочитать тайл: {tile_info.path}")
+
+    tile_height, tile_width = tile_image.shape[:2]
+    expected_size = (tile_info.y1 - tile_info.y0 + 1, tile_info.x1 - tile_info.x0 + 1)
+    if (tile_height, tile_width) != expected_size:
+        raise ValueError(
+            f"размер тайла {tile_info.path.name} — {tile_width}x{tile_height}, "
+            f"а по имени координат должен быть {expected_size[1]}x{expected_size[0]}"
+        )
+
+    tile_dot_candidates: list[dict[str, float]] = []
+    try:
+        candidates = detect_all(
+            tile_image,
+            tile_info.x0,
+            tile_info.y0,
+            dot_candidates_out=tile_dot_candidates,
+        )
+    except cv2.error as exc:
+        raise RuntimeError(f"ошибка детектора на тайле {tile_info.path.name}: {exc}") from exc
+    return candidates, tile_dot_candidates
+
+
+def _iter_tile_candidates(
+    tiles: list[Tile], workers: int
+) -> Iterator[tuple[Tile, list[tuple[Any, ...]], list[dict[str, float]]]]:
+    """Yield detector results tile by tile, optionally across several processes."""
+    if workers > 1 and len(tiles) > 1:
+        from concurrent.futures import ProcessPoolExecutor
+
+        with ProcessPoolExecutor(max_workers=min(workers, len(tiles))) as pool:
+            for tile_info, (candidates, dots) in zip(
+                tiles, pool.map(_detect_tile_candidates, tiles)
+            ):
+                yield tile_info, candidates, dots
+    else:
+        for tile_info in tiles:
+            candidates, dots = _detect_tile_candidates(tile_info)
+            yield tile_info, candidates, dots
+
+
 def detect_tiles(
-    tiles: list[Tile], width: int, height: int, tile_size: int = DEFAULT_TILE_SIZE
+    tiles: list[Tile],
+    width: int,
+    height: int,
+    tile_size: int = DEFAULT_TILE_SIZE,
+    grouping_stride: int | None = None,
+    workers: int = 1,
 ) -> list[dict[str, Any]]:
+    """Detect features on every tile and merge them into global coordinates.
+
+    ``tile_size`` and ``grouping_stride`` control only the global dot-row
+    grouping windows. Rectangular grid tiles (for example 10×2 row tiles) can
+    be passed as well; their pixel bounds are read from the ``Tile`` entries.
+    ``workers`` > 1 processes independent tiles in parallel processes.
+    """
+    if grouping_stride is not None and grouping_stride <= 0:
+        raise ValueError("grouping_stride должен быть больше нуля")
+    if workers <= 0:
+        raise ValueError("workers должен быть больше нуля")
     all_lines: list[dict[str, Any]] = []
     all_dot_candidates: list[dict[str, float]] = []
     seen: set[tuple[Any, ...]] = set()
 
-    for index, tile_info in enumerate(tiles, start=1):
-        tile_image = cv2.imread(str(tile_info.path), cv2.IMREAD_COLOR)
-        if tile_image is None:
-            raise ValueError(f"OpenCV не смог прочитать тайл: {tile_info.path}")
-
-        tile_height, tile_width = tile_image.shape[:2]
-        expected_size = (tile_info.y1 - tile_info.y0 + 1, tile_info.x1 - tile_info.x0 + 1)
-        if (tile_height, tile_width) != expected_size:
-            raise ValueError(
-                f"размер тайла {tile_info.path.name} — {tile_width}x{tile_height}, "
-                f"а по имени координат должен быть {expected_size[1]}x{expected_size[0]}"
-            )
-
-        try:
-            candidates = detect_all(
-                tile_image,
-                tile_info.x0,
-                tile_info.y0,
-                dot_candidates_out=all_dot_candidates,
-            )
-        except cv2.error as exc:
-            raise RuntimeError(f"ошибка детектора на тайле {tile_info.path.name}: {exc}") from exc
+    for index, (tile_info, candidates, tile_dots) in enumerate(
+        _iter_tile_candidates(tiles, workers), start=1
+    ):
+        all_dot_candidates.extend(tile_dots)
 
         for candidate in candidates:
             x1, y1, x2, y2, length, angle, line_type = candidate[:7]
@@ -315,7 +360,7 @@ def detect_tiles(
             seen.add(key)
             all_lines.append(record)
 
-        if index % 25 == 0 or index == len(tiles):
+        if len(tiles) <= 50 or index % 25 == 0 or index == len(tiles):
             print(f"Обработано тайлов: {index}/{len(tiles)}", flush=True)
 
     print(
@@ -383,7 +428,7 @@ def detect_tiles(
         )
     aligned_dots = group_dot_candidates_in_windows(
         candidates_off_lines,
-        tile_size,
+        grouping_stride or tile_size,
         report_progress=True,
         preferred_axis=preferred_axis,
     )
