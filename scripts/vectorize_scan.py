@@ -287,6 +287,7 @@ def detect_grid(
         height,
         grouping_stride=grouping_stride or default_grouping_stride(tiles),
         workers=workers,
+        report_every=1,
     )
 
 

@@ -315,6 +315,7 @@ def detect_tiles(
     tile_size: int = DEFAULT_TILE_SIZE,
     grouping_stride: int | None = None,
     workers: int = 1,
+    report_every: int | None = None,
 ) -> list[dict[str, Any]]:
     """Detect features on every tile and merge them into global coordinates.
 
@@ -322,11 +323,15 @@ def detect_tiles(
     grouping windows. Rectangular grid tiles (for example 10×2 row tiles) can
     be passed as well; their pixel bounds are read from the ``Tile`` entries.
     ``workers`` > 1 processes independent tiles in parallel processes.
+    ``report_every`` overrides the tile progress interval (default keeps the
+    original behaviour: every 25 tiles and once at the end).
     """
     if grouping_stride is not None and grouping_stride <= 0:
         raise ValueError("grouping_stride должен быть больше нуля")
     if workers <= 0:
         raise ValueError("workers должен быть больше нуля")
+    if report_every is not None and report_every <= 0:
+        raise ValueError("report_every должен быть больше нуля")
     all_lines: list[dict[str, Any]] = []
     all_dot_candidates: list[dict[str, float]] = []
     seen: set[tuple[Any, ...]] = set()
@@ -360,7 +365,8 @@ def detect_tiles(
             seen.add(key)
             all_lines.append(record)
 
-        if len(tiles) <= 50 or index % 25 == 0 or index == len(tiles):
+        progress_step = report_every or 25
+        if index % progress_step == 0 or index == len(tiles):
             print(f"Обработано тайлов: {index}/{len(tiles)}", flush=True)
 
     print(
