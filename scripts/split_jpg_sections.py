@@ -4,7 +4,7 @@
 For each source image, create ``<stem>_<tile-size>x<tile-size>/`` beside it,
 with plain tiles in ``tiles/``, soft-grid copies in ``tiles_with_grid/``, and
 ``tile_map.jpg`` showing pink tile outlines and coordinate filenames. The grid
-is local to each tile, at 10 px and 50 px intervals.
+is local to each tile: 10 px solid, 25 px dashed, and 50 px major lines.
 """
 
 from __future__ import annotations
@@ -29,16 +29,28 @@ DEFAULT_INPUT_DIR = Path(
     "Графика_разрезы/new_project"
 )
 DEFAULT_TILE_SIZE = 1000
+DEFAULT_ADDITIONAL_TILE_SIZE = 500
 DEFAULT_OVERLAP = 100
 PLAIN_TILES_DIR = "tiles"
 GRID_TILES_DIR = "tiles_with_grid"
 OUTPUT_SUBDIRS = (PLAIN_TILES_DIR, GRID_TILES_DIR)
 OUTPUT_FILES = ("tile_map.jpg",)
 
-# OpenCV colors use BGR order.
-MINOR_GRID_COLOR = (255, 210, 0)  # light cyan
+GRID_MINOR_STEP = 10
+GRID_HALF_STEP = 25
+GRID_MAJOR_STEP = 50
+GRID_DASH_LENGTH = 8
+GRID_DASH_GAP = 8
+GRID_MINOR_ALPHA = 0.38
+GRID_HALF_ALPHA = 0.45
+GRID_MAJOR_ALPHA = 0.35
+
+# OpenCV colors use BGR order. The requested minor RGB (0, 110, 180) becomes
+# BGR (180, 110, 0); the half-step is a dark indigo-purple.
+MINOR_GRID_COLOR = (180, 110, 0)
+HALF_GRID_COLOR = (100, 45, 65)
 MAJOR_GRID_COLOR = (255, 0, 255)  # magenta
-Y_COORDINATE_COLOR = (220, 0, 0)  # blue
+Y_COORDINATE_COLOR = (180, 45, 0)  # deep blue
 TILE_MAP_COLOR = (203, 0, 255)  # vivid pink
 
 
@@ -250,22 +262,94 @@ def write_tile_map(
     return output_path
 
 
+def draw_dashed_grid_line(
+    image: Any,
+    start: tuple[int, int],
+    end: tuple[int, int],
+    color: tuple[int, int, int],
+    dash_length: int = GRID_DASH_LENGTH,
+    dash_gap: int = GRID_DASH_GAP,
+) -> None:
+    """Draw one horizontal or vertical dashed segment into ``image``."""
+    x1, y1 = start
+    x2, y2 = end
+    if y1 == y2:
+        line_length = abs(x2 - x1)
+        direction = 1 if x2 >= x1 else -1
+        for offset in range(0, line_length + 1, dash_length + dash_gap):
+            end_offset = min(offset + dash_length - 1, line_length)
+            cv2.line(
+                image,
+                (x1 + direction * offset, y1),
+                (x1 + direction * end_offset, y1),
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+    elif x1 == x2:
+        line_length = abs(y2 - y1)
+        direction = 1 if y2 >= y1 else -1
+        for offset in range(0, line_length + 1, dash_length + dash_gap):
+            end_offset = min(offset + dash_length - 1, line_length)
+            cv2.line(
+                image,
+                (x1, y1 + direction * offset),
+                (x1, y1 + direction * end_offset),
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+    else:
+        raise ValueError("линия сетки должна быть горизонтальной или вертикальной")
+
+
+def put_coordinate_label(
+    image: Any,
+    text: str,
+    origin: tuple[int, int],
+    color: tuple[int, int, int],
+    scale: float = 0.8,
+) -> None:
+    """Draw a coordinate with a one-pixel white halo for contrast."""
+    cv2.putText(
+        image,
+        text,
+        origin,
+        cv2.FONT_HERSHEY_PLAIN,
+        scale,
+        (255, 255, 255),
+        3,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        image,
+        text,
+        origin,
+        cv2.FONT_HERSHEY_PLAIN,
+        scale,
+        color,
+        1,
+        cv2.LINE_AA,
+    )
+
+
 def apply_soft_grid(
     image: Any,
     filename: str | None = None,
-    minor_step: int = 10,
-    major_step: int = 50,
+    minor_step: int = GRID_MINOR_STEP,
+    half_step: int = GRID_HALF_STEP,
+    major_step: int = GRID_MAJOR_STEP,
 ) -> Any:
-    """Return a tile with a light 10 px grid, 50 px grid and coordinate labels."""
-    if minor_step <= 0 or major_step <= 0:
+    """Draw contrastive 10 px, dashed 25 px and magenta 50 px grid lines."""
+    if minor_step <= 0 or half_step <= 0 or major_step <= 0:
         raise ValueError("шаг сетки должен быть больше нуля")
-    if major_step % minor_step != 0:
-        raise ValueError("крупный шаг сетки должен делиться на мелкий")
+    if major_step % minor_step != 0 or major_step % half_step != 0:
+        raise ValueError("основной шаг должен делиться на мелкий и полушаг без остатка")
 
     height, width = image.shape[:2]
     result = image.copy()
 
-    # Fine lines, except where the stronger 50 px lines will be drawn.
+    # Fine 10 px grid: saturated blue-turquoise, blended at 38% opacity.
     minor_overlay = result.copy()
     for x in range(minor_step, width, minor_step):
         if x % major_step != 0:
@@ -275,6 +359,7 @@ def apply_soft_grid(
                 (x, height - 1),
                 MINOR_GRID_COLOR,
                 1,
+                cv2.LINE_AA,
             )
     for y in range(minor_step, height, minor_step):
         if y % major_step != 0:
@@ -284,10 +369,29 @@ def apply_soft_grid(
                 (width - 1, y),
                 MINOR_GRID_COLOR,
                 1,
+                cv2.LINE_AA,
             )
-    result = cv2.addWeighted(minor_overlay, 0.18, result, 0.82, 0)
+    result = cv2.addWeighted(
+        minor_overlay, GRID_MINOR_ALPHA, result, 1.0 - GRID_MINOR_ALPHA, 0
+    )
 
-    # Stronger 50 px reference lines.
+    # Dashed 25 px half-step grid, excluding 50 px major intersections.
+    half_overlay = result.copy()
+    for x in range(half_step, width, half_step):
+        if x % major_step != 0:
+            draw_dashed_grid_line(
+                half_overlay, (x, 0), (x, height - 1), HALF_GRID_COLOR
+            )
+    for y in range(half_step, height, half_step):
+        if y % major_step != 0:
+            draw_dashed_grid_line(
+                half_overlay, (0, y), (width - 1, y), HALF_GRID_COLOR
+            )
+    result = cv2.addWeighted(
+        half_overlay, GRID_HALF_ALPHA, result, 1.0 - GRID_HALF_ALPHA, 0
+    )
+
+    # Magenta 50 px reference grid is drawn last and remains easy to see.
     major_overlay = result.copy()
     for x in range(major_step, width, major_step):
         cv2.line(
@@ -296,6 +400,7 @@ def apply_soft_grid(
             (x, height - 1),
             MAJOR_GRID_COLOR,
             1,
+            cv2.LINE_AA,
         )
     for y in range(major_step, height, major_step):
         cv2.line(
@@ -304,50 +409,42 @@ def apply_soft_grid(
             (width - 1, y),
             MAJOR_GRID_COLOR,
             1,
+            cv2.LINE_AA,
         )
-    result = cv2.addWeighted(major_overlay, 0.35, result, 0.65, 0)
+    result = cv2.addWeighted(
+        major_overlay, GRID_MAJOR_ALPHA, result, 1.0 - GRID_MAJOR_ALPHA, 0
+    )
 
-    # Coordinate labels on the 50 px grid, matching the supplied example.
-    text_overlay = result.copy()
-    y_positions = sorted(
-        {
-            position
-            for position in [12, *range(248, height, 250), height - 4]
-            if 0 <= position < height
-        }
-    )
-    x_positions = sorted(
-        {
-            position
-            for position in [2, *range(252, width, 250), width - 28]
-            if 0 <= position < width
-        }
-    )
+    # Put x labels a few pixels into each 50 px cell at 250 px intervals;
+    # y labels sit below horizontal lines. Their rows are staggered to avoid
+    # colliding with x labels and with the tile-name badge.
+    x_label_rows = list(range(0, height, 250))
     for x in range(major_step, width, major_step):
-        for y_position in y_positions:
-            cv2.putText(
-                text_overlay,
+        for row_top in x_label_rows:
+            label_y = min(height - 2, row_top + 35)
+            put_coordinate_label(
+                result,
                 str(x),
-                (x + 2, y_position),
-                cv2.FONT_HERSHEY_PLAIN,
-                0.65,
+                (min(width - 1, x + 4), label_y),
                 MAJOR_GRID_COLOR,
-                1,
-                cv2.LINE_AA,
             )
+
+    y_label_columns = sorted(
+        {
+            column
+            for column in [0, *range(250, width, 250), max(0, width - 28)]
+            if column < width
+        }
+    )
     for y in range(major_step, height, major_step):
-        for x_position in x_positions:
-            cv2.putText(
-                text_overlay,
+        for column_left in y_label_columns:
+            label_y = min(height - 2, y + 14)
+            put_coordinate_label(
+                result,
                 str(y),
-                (x_position, y - 2),
-                cv2.FONT_HERSHEY_PLAIN,
-                0.65,
+                (min(width - 1, column_left + 4), label_y),
                 Y_COORDINATE_COLOR,
-                1,
-                cv2.LINE_AA,
             )
-    result = cv2.addWeighted(text_overlay, 0.65, result, 0.35, 0)
 
     if filename:
         result = add_filename_label(result, filename)
@@ -438,18 +535,34 @@ def process_directory(
     overlap: int = DEFAULT_OVERLAP,
     recursive: bool = False,
     overwrite: bool = False,
+    additional_tile_size: int | None = DEFAULT_ADDITIONAL_TILE_SIZE,
 ) -> list[dict[str, Any]]:
-    """Process all JPG/JPEG files found in a folder."""
+    """Process JPG/JPEG files at the primary and optional secondary sizes."""
+    if tile_size <= 0:
+        raise ValueError("размер тайла должен быть больше нуля")
+    if additional_tile_size is not None and additional_tile_size < 0:
+        raise ValueError("дополнительный размер тайла не может быть отрицательным")
+
+    tile_sizes = [tile_size]
+    if additional_tile_size not in (None, 0, tile_size):
+        tile_sizes.append(additional_tile_size)
+    for size in tile_sizes:
+        if overlap < 0 or overlap >= size:
+            raise ValueError(
+                f"перекрытие должно быть от 0 до {size - 1} px для тайла {size}x{size}"
+            )
+
     input_dir = input_dir.expanduser().resolve()
     images = find_jpg_images(input_dir, recursive=recursive)
     if not images:
         return []
 
-    # Two different extensions with the same stem would otherwise target the
-    # same output folder; report that clearly before writing any results.
+    # Two source images with the same stem and parent would target the same
+    # output folder for a given size; detect all collisions before writing.
     output_paths = [
-        (path.parent / f"{path.stem}_{tile_size}x{tile_size}").resolve()
-        for path in images
+        (image_path.parent / f"{image_path.stem}_{size}x{size}").resolve()
+        for image_path in images
+        for size in tile_sizes
     ]
     normalized_output_paths = [str(path).casefold() for path in output_paths]
     if len(normalized_output_paths) != len(set(normalized_output_paths)):
@@ -461,31 +574,33 @@ def process_directory(
     results = []
     for index, image_path in enumerate(images, start=1):
         print(f"[{index}/{len(images)}] Обрабатываю: {image_path}", flush=True)
-        result = process_image(
-            image_path,
-            tile_size=tile_size,
-            overlap=overlap,
-            overwrite=overwrite,
-        )
-        results.append(result)
-        print(
-            f"  {result['width']}×{result['height']} px → "
-            f"{result['tile_count']} тайлов "
-            f"({result['columns']}×{result['rows']}); "
-            f"результаты: {result['output_dir']}",
-            flush=True,
-        )
-        print(f"  Карта разбивки: {result['tile_map']}", flush=True)
+        for size in tile_sizes:
+            print(f"  Нарезка на {size}×{size} px...", flush=True)
+            result = process_image(
+                image_path,
+                tile_size=size,
+                overlap=overlap,
+                overwrite=overwrite,
+            )
+            results.append(result)
+            print(
+                f"    {result['width']}×{result['height']} px → "
+                f"{result['tile_count']} тайлов "
+                f"({result['columns']}×{result['rows']}); "
+                f"результаты: {result['output_dir']}",
+                flush=True,
+            )
+            print(f"    Карта разбивки: {result['tile_map']}", flush=True)
     return results
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Найти JPG/JPEG-сканы и нарезать каждый на PNG-тайлы. "
-            "Для каждого изображения создаются папки tiles/ и tiles_with_grid/, "
-            "а также tile_map.jpg с розовыми границами тайлов и именами файлов. "
-            "В именах тайлов указаны включительные координаты x0_y0_x1_y1."
+            "Найти JPG/JPEG-сканы и создать PNG-тайлы в двух размерах "
+            "(по умолчанию 1000x1000 и 500x500). Для каждого размера создаются "
+            "tiles/, tiles_with_grid/ и tile_map.jpg с границами и именами файлов. "
+            "Имена PNG содержат включительные координаты x0_y0_x1_y1."
         )
     )
     parser.add_argument(
@@ -499,7 +614,13 @@ def main() -> int:
         "--tile-size",
         type=positive_int,
         default=DEFAULT_TILE_SIZE,
-        help="ширина и высота тайла в пикселях (по умолчанию: 1000)",
+        help="основной размер тайла (по умолчанию: 1000; также создаётся размер --also-tile-size)",
+    )
+    parser.add_argument(
+        "--also-tile-size",
+        type=non_negative_int,
+        default=DEFAULT_ADDITIONAL_TILE_SIZE,
+        help="второй размер тайла (по умолчанию: 500; 0 отключает второй размер)",
     )
     parser.add_argument(
         "--overlap",
@@ -529,6 +650,7 @@ def main() -> int:
             overlap=args.overlap,
             recursive=args.recursive,
             overwrite=args.overwrite,
+            additional_tile_size=args.also_tile_size or None,
         )
     except (OSError, ValueError, cv2.error) as exc:
         parser.exit(2, f"Ошибка: {exc}\n")
@@ -538,9 +660,10 @@ def main() -> int:
         return 0
 
     total_tiles = sum(result["tile_count"] for result in results)
+    source_count = len({result["image_path"] for result in results})
     print(
-        f"Готово: обработано изображений — {len(results)}, "
-        f"тайлов — {total_tiles}.",
+        f"Готово: обработано изображений — {source_count}, "
+        f"вариантов размера — {len(results)}, тайлов — {total_tiles}.",
         flush=True,
     )
     return 0

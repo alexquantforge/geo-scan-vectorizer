@@ -110,6 +110,19 @@ class SplitJpgSectionTests(unittest.TestCase):
                 {"a.JPG", "b.jpeg"},
             )
 
+    def test_grid_has_contrastive_minor_dashed_half_and_major_lines(self) -> None:
+        source = np.full((100, 100, 3), (185, 195, 225), dtype=np.uint8)
+        grid = apply_soft_grid(source)
+
+        # The 10 px line and 50 px major line are visible over the warm paper.
+        self.assertFalse(np.array_equal(grid[5, 10], source[5, 10]))
+        self.assertFalse(np.array_equal(grid[5, 50], source[5, 50]))
+        # The 25 px half-step is dashed: first dash is drawn, then a gap.
+        self.assertFalse(np.array_equal(grid[5, 25], source[5, 25]))
+        np.testing.assert_array_equal(grid[13, 25], source[13, 25])
+        # The coordinate glyphs have a white halo around their colored strokes.
+        self.assertTrue(np.any(np.all(grid[25:36, 50:80] == 255, axis=2)))
+
     def test_directory_batch_creates_one_output_folder_per_jpg(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -121,7 +134,9 @@ class SplitJpgSectionTests(unittest.TestCase):
                     )
                 )
 
-            results = process_directory(root, tile_size=10, overlap=0)
+            results = process_directory(
+                root, tile_size=10, overlap=0, additional_tile_size=None
+            )
 
             self.assertEqual(len(results), 2)
             self.assertEqual(
@@ -136,6 +151,34 @@ class SplitJpgSectionTests(unittest.TestCase):
                 )
             )
             self.assertTrue(all(result["tile_map"].is_file() for result in results))
+
+    def test_default_batch_also_creates_500px_tile_set(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "scan.jpg"
+            self.assertTrue(
+                cv2.imwrite(
+                    str(source),
+                    np.full((600, 600, 3), 190, dtype=np.uint8),
+                )
+            )
+
+            results = process_directory(root, overlap=0)
+
+            self.assertEqual(
+                {result["output_dir"].name for result in results},
+                {"scan_1000x1000", "scan_500x500"},
+            )
+            by_size = {result["output_dir"].name: result for result in results}
+            self.assertEqual(by_size["scan_1000x1000"]["tile_count"], 1)
+            self.assertEqual(by_size["scan_500x500"]["tile_count"], 4)
+            for result in results:
+                for subdir in (PLAIN_TILES_DIR, GRID_TILES_DIR):
+                    self.assertEqual(
+                        len(list((result["output_dir"] / subdir).glob("*.png"))),
+                        result["tile_count"],
+                    )
+                self.assertTrue(result["tile_map"].is_file())
 
     def test_overwrite_rebuilds_tile_folders_and_tile_map(self) -> None:
         image = np.full((12, 12, 3), 190, dtype=np.uint8)
