@@ -2,8 +2,9 @@
 """Split JPG geological sections into coordinate-named PNG tiles.
 
 For each source image, create ``<stem>_<tile-size>x<tile-size>/`` beside it,
-with the plain tiles in ``tiles/`` and soft-grid copies in ``tiles_with_grid/``.
-The grid is local to each tile, at 10 px and 50 px intervals.
+with plain tiles in ``tiles/``, soft-grid copies in ``tiles_with_grid/``, and
+``tile_map.jpg`` showing pink tile outlines and coordinate filenames. The grid
+is local to each tile, at 10 px and 50 px intervals.
 """
 
 from __future__ import annotations
@@ -32,11 +33,13 @@ DEFAULT_OVERLAP = 100
 PLAIN_TILES_DIR = "tiles"
 GRID_TILES_DIR = "tiles_with_grid"
 OUTPUT_SUBDIRS = (PLAIN_TILES_DIR, GRID_TILES_DIR)
+OUTPUT_FILES = ("tile_map.jpg",)
 
 # OpenCV colors use BGR order.
 MINOR_GRID_COLOR = (255, 210, 0)  # light cyan
 MAJOR_GRID_COLOR = (255, 0, 255)  # magenta
 Y_COORDINATE_COLOR = (220, 0, 0)  # blue
+TILE_MAP_COLOR = (203, 0, 255)  # vivid pink
 
 
 def positive_int(value: str) -> int:
@@ -121,7 +124,8 @@ def prepare_output_directory(output_dir: Path, overwrite: bool) -> None:
 
     if output_dir.exists():
         entries = list(output_dir.iterdir())
-        unexpected = [entry for entry in entries if entry.name not in OUTPUT_SUBDIRS]
+        allowed_entries = set(OUTPUT_SUBDIRS) | set(OUTPUT_FILES)
+        unexpected = [entry for entry in entries if entry.name not in allowed_entries]
         if unexpected:
             names = ", ".join(entry.name for entry in unexpected[:5])
             raise FileExistsError(
@@ -145,10 +149,27 @@ def prepare_output_directory(output_dir: Path, overwrite: bool) -> None:
         (output_dir / name).mkdir(parents=True, exist_ok=True)
 
 
-def add_filename_label(image: Any, filename: str) -> Any:
-    """Draw a small, readable tile filename in the upper-left corner."""
-    height, width = image.shape[:2]
-    if height == 0 or width == 0:
+def draw_filename_label(
+    image: Any,
+    filename: str,
+    x: int = 0,
+    y: int = 0,
+    max_width: int | None = None,
+    max_height: int | None = None,
+) -> Any:
+    """Draw a small filename badge at ``(x, y)`` without changing other pixels."""
+    image_height, image_width = image.shape[:2]
+    left = max(0, min(x, image_width - 1))
+    top = max(0, min(y, image_height - 1))
+    allowed_width = min(
+        image_width - left,
+        max_width if max_width is not None else image_width - left,
+    )
+    allowed_height = min(
+        image_height - top,
+        max_height if max_height is not None else image_height - top,
+    )
+    if allowed_width <= 0 or allowed_height <= 0:
         return image
 
     font = cv2.FONT_HERSHEY_PLAIN
@@ -157,24 +178,27 @@ def add_filename_label(image: Any, filename: str) -> Any:
     (text_width, text_height), baseline = cv2.getTextSize(
         filename, font, scale, thickness
     )
-    max_text_width = max(1, width - 8)
+    max_text_width = max(1, allowed_width - 6)
+    max_text_height = max(1, allowed_height - 6)
     if text_width > max_text_width:
         scale *= max_text_width / text_width
-        (text_width, text_height), baseline = cv2.getTextSize(
-            filename, font, scale, thickness
-        )
+    if text_height + baseline > max_text_height:
+        scale *= max_text_height / max(text_height + baseline, 1)
+    (text_width, text_height), baseline = cv2.getTextSize(
+        filename, font, scale, thickness
+    )
 
-    right = min(width - 1, text_width + 7)
-    bottom = min(height - 1, text_height + baseline + 6)
-    panel = image.copy()
-    cv2.rectangle(panel, (0, 0), (right, bottom), (255, 255, 255), -1)
-    cv2.addWeighted(panel, 0.82, image, 0.18, 0, dst=image)
+    badge_width = min(allowed_width, text_width + 6)
+    badge_height = min(allowed_height, text_height + baseline + 6)
+    badge = image[top : top + badge_height, left : left + badge_width]
+    white = np.full_like(badge, 255)
+    cv2.addWeighted(white, 0.82, badge, 0.18, 0, dst=badge)
 
-    baseline_y = min(height - 1, text_height + 3)
+    baseline_y = min(top + badge_height - 1, top + text_height + 3)
     cv2.putText(
         image,
         filename,
-        (3, baseline_y),
+        (left + 3, baseline_y),
         font,
         scale,
         (0, 0, 0),
@@ -182,6 +206,48 @@ def add_filename_label(image: Any, filename: str) -> Any:
         cv2.LINE_AA,
     )
     return image
+
+
+def add_filename_label(image: Any, filename: str) -> Any:
+    """Draw a small, readable tile filename in the upper-left corner."""
+    return draw_filename_label(image, filename)
+
+
+def write_tile_map(
+    image: Any,
+    tiles: list[tuple[int, int, int, int, str]],
+    output_path: Path,
+) -> Path:
+    """Draw pink tile boundaries and tile filenames into the scan buffer."""
+    # The source array is no longer needed after cropping, so drawing in place
+    # avoids allocating a second full-size image for large geological scans.
+    for x0, y0, x1, y1, _filename in tiles:
+        cv2.rectangle(
+            image,
+            (x0, y0),
+            (x1, y1),
+            TILE_MAP_COLOR,
+            3,
+            cv2.LINE_AA,
+        )
+
+    for x0, y0, x1, y1, filename in tiles:
+        draw_filename_label(
+            image,
+            filename,
+            x=x0 + 4,
+            y=y0 + 4,
+            max_width=max(1, x1 - x0 - 6),
+            max_height=max(1, y1 - y0 - 6),
+        )
+
+    success, encoded = cv2.imencode(
+        ".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 95]
+    )
+    if not success:
+        raise OSError(f"не удалось закодировать карту разбивки: {output_path}")
+    output_path.write_bytes(encoded.tobytes())
+    return output_path
 
 
 def apply_soft_grid(
@@ -332,7 +398,7 @@ def process_image(
     x_starts = tile_starts(width, tile_size, overlap)
     y_starts = tile_starts(height, tile_size, overlap)
     digits = max(1, len(str(max(width - 1, height - 1))))
-    tile_count = 0
+    tile_bounds: list[tuple[int, int, int, int, str]] = []
 
     for y0 in y_starts:
         for x0 in x_starts:
@@ -349,16 +415,20 @@ def process_image(
             grid_tile = apply_soft_grid(tile, filename=tile_name)
             _write_png(output_dir / PLAIN_TILES_DIR / tile_name, plain_tile)
             _write_png(output_dir / GRID_TILES_DIR / tile_name, grid_tile)
-            tile_count += 1
+            tile_bounds.append((x0, y0, x1, y1, tile_name))
 
+    tile_map_path = write_tile_map(
+        image, tile_bounds, output_dir / "tile_map.jpg"
+    )
     return {
         "image_path": image_path,
         "output_dir": output_dir,
         "width": width,
         "height": height,
-        "tile_count": tile_count,
+        "tile_count": len(tile_bounds),
         "columns": len(x_starts),
         "rows": len(y_starts),
+        "tile_map": tile_map_path,
     }
 
 
@@ -405,6 +475,7 @@ def process_directory(
             f"результаты: {result['output_dir']}",
             flush=True,
         )
+        print(f"  Карта разбивки: {result['tile_map']}", flush=True)
     return results
 
 
@@ -412,8 +483,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Найти JPG/JPEG-сканы и нарезать каждый на PNG-тайлы. "
-            "Для каждого изображения создаются папки tiles/ и tiles_with_grid/; "
-            "в именах тайлов указаны включительные координаты x0_y0_x1_y1."
+            "Для каждого изображения создаются папки tiles/ и tiles_with_grid/, "
+            "а также tile_map.jpg с розовыми границами тайлов и именами файлов. "
+            "В именах тайлов указаны включительные координаты x0_y0_x1_y1."
         )
     )
     parser.add_argument(

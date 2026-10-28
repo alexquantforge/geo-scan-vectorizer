@@ -69,6 +69,14 @@ class SplitJpgSectionTests(unittest.TestCase):
             # The fine grid visibly changes a pixel that is away from the title.
             self.assertFalse(np.array_equal(plain[100, 80], gridded[100, 80]))
 
+            tile_map = cv2.imread(str(result["tile_map"]), cv2.IMREAD_COLOR)
+            self.assertEqual(tile_map.shape, (1200, 1400, 3))
+            # The map shows a bright pink outline at a tile boundary.
+            pink_pixel = tile_map[150, 400]
+            self.assertGreater(int(pink_pixel[0]), 100)
+            self.assertLess(int(pink_pixel[1]), 100)
+            self.assertGreater(int(pink_pixel[2]), 100)
+
     def test_no_overlap_allows_smaller_right_and_bottom_edge_tiles(self) -> None:
         image = np.full((1050, 1100, 3), 180, dtype=np.uint8)
 
@@ -127,6 +135,22 @@ class SplitJpgSectionTests(unittest.TestCase):
                     for result in results
                 )
             )
+            self.assertTrue(all(result["tile_map"].is_file() for result in results))
+
+    def test_overwrite_rebuilds_tile_folders_and_tile_map(self) -> None:
+        image = np.full((12, 12, 3), 190, dtype=np.uint8)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "section.jpg"
+            self.assertTrue(cv2.imwrite(str(source), image))
+
+            first = process_image(source, tile_size=10, overlap=0)
+            with self.assertRaises(FileExistsError):
+                process_image(source, tile_size=10, overlap=0)
+            second = process_image(source, tile_size=10, overlap=0, overwrite=True)
+
+            self.assertEqual(first["tile_map"], second["tile_map"])
+            self.assertTrue(second["tile_map"].is_file())
 
     def test_grid_rejects_non_divisible_steps(self) -> None:
         with self.assertRaises(ValueError):
